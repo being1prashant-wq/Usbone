@@ -1,3 +1,24 @@
 <resources>
     <string name="app_name">DirectUSB</string>
+    <string name="ptp_media">PTP MEDIA</string>
+    <string name="connect_phone">Connect your phone using USB</string>
+    <string name="select_ptp_hint">On your phone select PTP / Transfer photos.</string>
+    <string name="photos">PHOTOS</string>
+    <string name="videos">VIDEOS</string>
+    <string name="btn_photos">[ PHOTOS ]</string>
+    <string name="btn_videos">[ VIDEOS ]</string>
+    <string name="photo_item">Photo</string>
+    <string name="video_item">Video</string>
+    <string name="no_photos">No photos available through PTP.</string>
+    <string name="no_videos">No videos available through PTP.</string>
+    <string name="photo_load_failed">Photo could not be loaded.</string>
+    <string name="video_load_failed">Video could not be loaded.</string>
+    <string name="video_codec_unsupported">Video format or codec not supported by this TV.</string>
+    <string name="buffering">Buffering...</string>
+    <string name="phone_disconnected">Phone disconnected</string>
+    <string name="ptp_device_detected">PTP device detected</string>
+    <string name="permission_required">USB permission required.</string>
+    <string name="permission_denied">USB permission denied.</string>
+    <string name="ptp_mode_required">PTP mode required</string>
+    <string name="session_failed">Could not start PTP session.</string>
 </resources>

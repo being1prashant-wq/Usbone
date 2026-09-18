@@ -5,50 +5,51 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
-import com.example.mtp.MtpClient
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+
+data class PtpInterfaceInfo(
+    val usbInterface: UsbInterface,
+    val bulkIn: UsbEndpoint,
+    val bulkOut: UsbEndpoint,
+    val interruptIn: UsbEndpoint?
+)
 
 sealed class UsbConnectionState {
+    object Idle : UsbConnectionState()
+    data class DeviceAttached(val device: UsbDevice) : UsbConnectionState()
+    data class PermissionRequired(val device: UsbDevice) : UsbConnectionState()
+    object PermissionDenied : UsbConnectionState()
+    data class Connected(val device: UsbDevice, val client: PtpClient, val deviceName: String) : UsbConnectionState()
+    data class Error(val message: String) : UsbConnectionState()
     object Disconnected : UsbConnectionState()
-    data class DeviceDetected(val device: UsbDevice, val displayName: String, val isPhone: Boolean) : UsbConnectionState()
-    data class PermissionRequired(val device: UsbDevice, val displayName: String) : UsbConnectionState()
-    data class OpeningDevice(val displayName: String) : UsbConnectionState()
-    data class IdentifyingProtocol(val displayName: String) : UsbConnectionState()
-    data class MtpInitializing(val displayName: String) : UsbConnectionState()
-    data class Ready(val device: UsbDevice, val displayName: String, val client: MtpClient) : UsbConnectionState()
-    data class Error(val message: String, val canRetry: Boolean = true) : UsbConnectionState()
 }
 
-class UsbHostManager(private val context: Context) {
-    private val tag = "UsbHostManager"
-    private val actionUsbPermission = "com.example.directusb.USB_PERMISSION"
+class UsbHostManager(
+    private val context: Context,
+    private val onStateChanged: (UsbConnectionState) -> Unit
+) {
+    companion object {
+        const val ACTION_USB_PERMISSION = "com.example.directusb.USB_PERMISSION"
+    }
 
-    private val usbManager = context.getSystemService(Context.USB_SERVICE) as? UsbManager
-
-    private val _connectionState = MutableStateFlow<UsbConnectionState>(UsbConnectionState.Disconnected)
-    val connectionState: StateFlow<UsbConnectionState> = _connectionState.asStateFlow()
-
-    private val _diagnostics = MutableStateFlow<UsbDeviceDiagnostics?>(null)
-    val diagnostics: StateFlow<UsbDeviceDiagnostics?> = _diagnostics.asStateFlow()
-
+    private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+    private var currentDevice: UsbDevice? = null
     private var currentConnection: UsbDeviceConnection? = null
-    private var claimedInterface: UsbInterface? = null
-    var activeMtpClient: MtpClient? = null
-        private set
-
-    private var selectedDevice: UsbDevice? = null
+    private var currentInterface: UsbInterface? = null
+    private var activePtpClient: PtpClient? = null
+    private var isReceiverRegistered = false
 
     private val usbReceiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, intent: Intent?) {
-            when (intent?.action) {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            when (action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
@@ -56,8 +57,10 @@ class UsbHostManager(private val context: Context) {
                         @Suppress("DEPRECATION")
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     }
-                    Log.d(tag, "USB Device Attached: ${device?.deviceName}")
-                    scanDevices()
+                    if (device != null) {
+                        Log.i(PtpConstants.TAG, "USB device attached: ${device.deviceName} (Product: ${device.productName})")
+                        handleDeviceAttached(device)
+                    }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -66,27 +69,26 @@ class UsbHostManager(private val context: Context) {
                         @Suppress("DEPRECATION")
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     }
-                    Log.d(tag, "USB Device Detached: ${device?.deviceName}")
-                    if (device == null || device == selectedDevice) {
-                        disconnectCurrentDevice("Phone disconnected")
+                    if (device != null && (currentDevice == null || device.deviceId == currentDevice?.deviceId)) {
+                        Log.i(PtpConstants.TAG, "USB device detached: ${device.deviceName}")
+                        disconnect()
                     }
                 }
-                actionUsbPermission -> {
-                    synchronized(this) {
-                        val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                ACTION_USB_PERMISSION -> {
+                    val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    if (device != null) {
+                        if (granted) {
+                            Log.i(PtpConstants.TAG, "USB permission granted for ${device.deviceName}")
+                            connectPtp(device)
                         } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-                        }
-                        val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                        Log.d(tag, "Permission result for ${device?.deviceName}: granted=$granted")
-                        if (device != null) {
-                            if (granted) {
-                                openAndInitializeDevice(device)
-                            } else {
-                                _connectionState.value = UsbConnectionState.Error("USB permission was denied.", canRetry = true)
-                            }
+                            Log.w(PtpConstants.TAG, "USB permission denied for ${device.deviceName}")
+                            onStateChanged(UsbConnectionState.PermissionDenied)
                         }
                     }
                 }
@@ -95,230 +97,170 @@ class UsbHostManager(private val context: Context) {
     }
 
     fun start() {
-        val filter = IntentFilter().apply {
-            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
-            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-            addAction(actionUsbPermission)
+        if (!isReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+                addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+                addAction(ACTION_USB_PERMISSION)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                context.registerReceiver(usbReceiver, filter)
+            }
+            isReceiverRegistered = true
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            context.registerReceiver(usbReceiver, filter)
-        }
-
-        scanDevices()
+        // Inspect currently connected devices at startup (no continuous polling)
+        inspectConnectedDevices()
     }
 
     fun stop() {
-        try {
-            context.unregisterReceiver(usbReceiver)
-        } catch (e: Exception) {
-            Log.e(tag, "Error unregistering USB receiver", e)
+        if (isReceiverRegistered) {
+            try {
+                context.unregisterReceiver(usbReceiver)
+            } catch (_: Exception) {}
+            isReceiverRegistered = false
         }
-        disconnectCurrentDevice("Application closing")
+        disconnect()
     }
 
-    fun scanDevices() {
-        val manager = usbManager ?: run {
-            _connectionState.value = UsbConnectionState.Error("USB Host API unavailable on this device.")
-            return
-        }
-
-        val deviceList = manager.deviceList
-        if (deviceList.isEmpty()) {
-            if (_connectionState.value !is UsbConnectionState.Disconnected) {
-                disconnectCurrentDevice("No USB device connected")
-            }
-            return
-        }
-
-        Log.d(tag, "Found ${deviceList.size} USB devices")
-
-        // Find candidate phones
-        var bestCandidate: Pair<UsbDevice, UsbDeviceCandidate>? = null
-
+    private fun inspectConnectedDevices() {
+        val deviceList = usbManager.deviceList
+        Log.i(PtpConstants.TAG, "Inspect connected devices: found ${deviceList.size} device(s)")
         for (device in deviceList.values) {
-            val candidates = UsbDeviceInspector.findCandidates(device)
-            val phoneCandidate = candidates.firstOrNull { it.deviceType == UsbDeviceType.MTP_PHONE }
-            if (phoneCandidate != null) {
-                bestCandidate = Pair(device, phoneCandidate)
-                break
-            } else if (candidates.isNotEmpty() && bestCandidate == null) {
-                bestCandidate = Pair(device, candidates.first())
+            val ptpInfo = findPtpInterface(device)
+            if (ptpInfo != null) {
+                Log.i(PtpConstants.TAG, "Found PTP device: ${device.deviceName} (Product: ${device.productName})")
+                handleDeviceAttached(device)
+                return
             }
         }
+        onStateChanged(UsbConnectionState.Idle)
+    }
 
-        if (bestCandidate != null) {
-            val (device, candidate) = bestCandidate
-            val displayName = UsbDeviceInspector.getDeviceDisplayName(device)
-            selectedDevice = device
+    private fun handleDeviceAttached(device: UsbDevice) {
+        val ptpInfo = findPtpInterface(device)
+        if (ptpInfo == null) {
+            Log.w(PtpConstants.TAG, "Device ${device.deviceName} has no PTP interface exposed.")
+            onStateChanged(UsbConnectionState.Error("No PTP interface was exposed by this device.\nOn your phone select PTP / Transfer photos."))
+            return
+        }
 
-            if (manager.hasPermission(device)) {
-                openAndInitializeDevice(device)
-            } else {
-                _connectionState.value = UsbConnectionState.PermissionRequired(device, displayName)
-            }
+        currentDevice = device
+        onStateChanged(UsbConnectionState.DeviceAttached(device))
+
+        if (usbManager.hasPermission(device)) {
+            Log.i(PtpConstants.TAG, "USB permission already held for ${device.deviceName}")
+            connectPtp(device)
         } else {
-            val first = deviceList.values.first()
-            _connectionState.value = UsbConnectionState.DeviceDetected(
-                device = first,
-                displayName = UsbDeviceInspector.getDeviceDisplayName(first),
-                isPhone = false
-            )
+            Log.i(PtpConstants.TAG, "Requesting USB permission for ${device.deviceName}")
+            onStateChanged(UsbConnectionState.PermissionRequired(device))
+            requestPermission(device)
         }
     }
 
-    fun requestPermissionForCurrentDevice() {
-        val device = selectedDevice ?: return
-        val manager = usbManager ?: return
-
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    fun requestPermission(device: UsbDevice) {
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
-
         val permissionIntent = PendingIntent.getBroadcast(
             context,
             0,
-            Intent(actionUsbPermission),
+            Intent(ACTION_USB_PERMISSION).setPackage(context.packageName),
             flags
         )
-
-        Log.d(tag, "Requesting USB permission for ${device.deviceName}")
-        manager.requestPermission(device, permissionIntent)
+        usbManager.requestPermission(device, permissionIntent)
     }
 
-    fun connectManually() {
-        val device = selectedDevice ?: run {
-            scanDevices()
-            return
-        }
-        val manager = usbManager ?: return
-        if (manager.hasPermission(device)) {
-            openAndInitializeDevice(device)
-        } else {
-            requestPermissionForCurrentDevice()
-        }
-    }
-
-    private fun openAndInitializeDevice(device: UsbDevice) {
-        val manager = usbManager ?: return
-        val displayName = UsbDeviceInspector.getDeviceDisplayName(device)
-        _connectionState.value = UsbConnectionState.OpeningDevice(displayName)
-
-        val candidates = UsbDeviceInspector.findCandidates(device)
-        if (candidates.isEmpty()) {
-            _connectionState.value = UsbConnectionState.Error("No compatible MTP/PTP USB interface found on $displayName.\nOn your phone, open the USB notification and select File Transfer.")
+    private fun connectPtp(device: UsbDevice) {
+        val ptpInfo = findPtpInterface(device)
+        if (ptpInfo == null) {
+            onStateChanged(UsbConnectionState.Error("No PTP interface was exposed by this device."))
             return
         }
 
-        // Try candidates in order
-        var success = false
-        for (candidate in candidates) {
-            _connectionState.value = UsbConnectionState.IdentifyingProtocol("Interface #${candidate.usbInterface.id}")
-            val connection = manager.openDevice(device)
-            if (connection == null) {
-                Log.e(tag, "Failed to open UsbDevice ${device.deviceName}")
-                continue
-            }
-
-            if (!connection.claimInterface(candidate.usbInterface, true)) {
-                Log.e(tag, "Failed to claim interface #${candidate.usbInterface.id}")
-                connection.close()
-                continue
-            }
-
-            _connectionState.value = UsbConnectionState.MtpInitializing(displayName)
-
-            val client = MtpClient(
-                connection = connection,
-                endpointIn = candidate.endpointIn,
-                endpointOut = candidate.endpointOut
-            )
-
-            // Attempt to open MTP session
-            if (client.openSession()) {
-                currentConnection = connection
-                claimedInterface = candidate.usbInterface
-                activeMtpClient = client
-                success = true
-
-                // Update diagnostics
-                _diagnostics.value = UsbDeviceDiagnostics(
-                    isHostSupported = true,
-                    deviceName = device.deviceName,
-                    vendorId = device.vendorId,
-                    productId = device.productId,
-                    manufacturer = try { device.manufacturerName ?: "Unknown" } catch (e: Exception) { "Unknown" },
-                    productName = try { device.productName ?: "Unknown" } catch (e: Exception) { "Unknown" },
-                    serialNumber = try { device.serialNumber ?: "Protected" } catch (e: Exception) { "N/A" },
-                    interfaceCount = device.interfaceCount,
-                    selectedInterfaceIndex = candidate.usbInterface.id,
-                    interfaceClass = candidate.usbInterface.interfaceClass,
-                    interfaceSubclass = candidate.usbInterface.interfaceSubclass,
-                    interfaceProtocol = candidate.usbInterface.interfaceProtocol,
-                    bulkInAddress = candidate.endpointIn.address,
-                    bulkInMaxPacket = candidate.endpointIn.maxPacketSize,
-                    bulkOutAddress = candidate.endpointOut.address,
-                    bulkOutMaxPacket = candidate.endpointOut.maxPacketSize,
-                    hasInterruptIn = candidate.endpointInterrupt != null,
-                    permissionGranted = true,
-                    isSessionOpen = true,
-                    readSpeedMbPerSec = 0f,
-                    bufferHealth = "Normal"
-                )
-
-                _connectionState.value = UsbConnectionState.Ready(
-                    device = device,
-                    displayName = displayName,
-                    client = client
-                )
-                break
-            } else {
-                Log.w(tag, "MTP handshake failed on interface #${candidate.usbInterface.id}")
-                connection.releaseInterface(candidate.usbInterface)
-                connection.close()
-            }
+        val connection = usbManager.openDevice(device)
+        if (connection == null) {
+            Log.e(PtpConstants.TAG, "Failed to open USB device connection")
+            onStateChanged(UsbConnectionState.Error("Could not open USB connection."))
+            return
         }
 
-        if (!success) {
-            _connectionState.value = UsbConnectionState.Error(
-                "Phone detected, but MTP storage interface is unavailable.\n" +
-                        "On your phone, open the USB notification and select File Transfer.",
-                canRetry = true
-            )
+        if (!connection.claimInterface(ptpInfo.usbInterface, true)) {
+            Log.e(PtpConstants.TAG, "Failed to claim PTP interface ${ptpInfo.usbInterface.id}")
+            connection.close()
+            onStateChanged(UsbConnectionState.Error("Could not claim PTP interface."))
+            return
         }
+
+        currentConnection = connection
+        currentInterface = ptpInfo.usbInterface
+
+        val client = PtpClient(connection, ptpInfo.bulkIn, ptpInfo.bulkOut)
+        activePtpClient = client
+
+        val fallbackName = device.productName ?: device.manufacturerName ?: "Phone"
+        onStateChanged(UsbConnectionState.Connected(device, client, fallbackName))
     }
 
-    fun updateSpeedMeasurement(mbPerSec: Float) {
-        _diagnostics.value = _diagnostics.value?.copy(readSpeedMbPerSec = mbPerSec)
-    }
-
-    fun disconnectCurrentDevice(reason: String) {
-        Log.d(tag, "Disconnecting current USB device: $reason")
-        try {
-            activeMtpClient?.closeSession()
-        } catch (e: Exception) {
-            Log.e(tag, "Error closing MTP session", e)
+    fun disconnect() {
+        Log.i(PtpConstants.TAG, "Disconnecting USB and releasing resources")
+        activePtpClient = null
+        currentInterface?.let { intf ->
+            try {
+                currentConnection?.releaseInterface(intf)
+            } catch (_: Exception) {}
         }
-        activeMtpClient = null
-
-        try {
-            claimedInterface?.let { currentConnection?.releaseInterface(it) }
-        } catch (e: Exception) {
-            Log.e(tag, "Error releasing USB interface", e)
-        }
-        claimedInterface = null
-
-        try {
-            currentConnection?.close()
-        } catch (e: Exception) {
-            Log.e(tag, "Error closing USB connection", e)
+        currentInterface = null
+        currentConnection?.let { conn ->
+            try {
+                conn.close()
+            } catch (_: Exception) {}
         }
         currentConnection = null
+        currentDevice = null
+        onStateChanged(UsbConnectionState.Disconnected)
+    }
 
-        _diagnostics.value = null
-        _connectionState.value = UsbConnectionState.Disconnected
+    /**
+     * Inspect all interfaces on the device to locate a PTP interface.
+     * Searches for:
+     * 1. USB Class 6 (Still Image), Subclass 1, Protocol 1
+     * 2. Or any interface with Bulk IN and Bulk OUT endpoints where Class == 6
+     */
+    fun findPtpInterface(device: UsbDevice): PtpInterfaceInfo? {
+        val count = device.interfaceCount
+        for (i in 0 until count) {
+            val intf = device.getInterface(i)
+            // Check class: 6 = USB_CLASS_STILL_IMAGE
+            val isStillImageClass = (intf.interfaceClass == UsbConstants.USB_CLASS_STILL_IMAGE)
+            val isPtpStandard = isStillImageClass && intf.interfaceSubclass == 1 && intf.interfaceProtocol == 1
+
+            var bulkIn: UsbEndpoint? = null
+            var bulkOut: UsbEndpoint? = null
+            var interruptIn: UsbEndpoint? = null
+
+            for (e in 0 until intf.endpointCount) {
+                val ep = intf.getEndpoint(e)
+                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                    if (ep.direction == UsbConstants.USB_DIR_IN) {
+                        bulkIn = ep
+                    } else if (ep.direction == UsbConstants.USB_DIR_OUT) {
+                        bulkOut = ep
+                    }
+                } else if (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT && ep.direction == UsbConstants.USB_DIR_IN) {
+                    interruptIn = ep
+                }
+            }
+
+            // Valid PTP interface must have both bulk IN and bulk OUT endpoints
+            if (bulkIn != null && bulkOut != null && (isPtpStandard || isStillImageClass)) {
+                Log.i(PtpConstants.TAG, "PTP interface detected at index $i (id=${intf.id})")
+                return PtpInterfaceInfo(intf, bulkIn, bulkOut, interruptIn)
+            }
+        }
+        return null
     }
 }
