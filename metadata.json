@@ -1,0 +1,6 @@
+{
+  "name": "DirectUSB",
+  "description": "Direct USB host MTP/PTP phone access and media player for Android TV",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
