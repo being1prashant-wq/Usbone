@@ -5,6 +5,7 @@ import android.media.MediaPlayer
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
+import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -205,9 +206,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private var initJob: kotlinx.coroutines.Job? = null
+
     private fun handleUsbState(state: UsbConnectionState) {
         when (state) {
             is UsbConnectionState.Idle -> {
+                initJob?.cancel()
                 tvStartStatus.text = ""
                 showScreen(Screen.START)
             }
@@ -218,34 +222,49 @@ class MainActivity : AppCompatActivity() {
                 tvStartStatus.text = getString(R.string.permission_required)
             }
             is UsbConnectionState.PermissionDenied -> {
+                initJob?.cancel()
                 tvStartStatus.text = getString(R.string.permission_denied)
             }
             is UsbConnectionState.Connected -> {
-                tvStartStatus.text = "Initializing PTP session..."
-                lifecycleScope.launch {
-                    val success = repository.initialize(state.client, state.deviceName)
-                    if (success) {
-                        tvHomeDeviceName.text = repository.deviceName
-                        updateMediaCounts()
-                        showScreen(Screen.HOME)
-                        btnPhotos.requestFocus()
-                    } else {
-                        tvStartStatus.text = getString(R.string.session_failed)
+                initJob?.cancel()
+                tvStartStatus.text = "PTP Initializing..."
+                showScreen(Screen.START)
+                initJob = lifecycleScope.launch {
+                    try {
+                        val success = repository.initialize(state.client, state.deviceName)
+                        if (success) {
+                            tvHomeDeviceName.text = repository.deviceName
+                            updateMediaCounts()
+                            showScreen(Screen.HOME)
+                            btnPhotos.requestFocus()
+                        } else {
+                            usbHostManager.disconnect()
+                            tvStartStatus.text = "PTP initialization failed.\nPlease check phone USB mode is set to 'PTP / Transfer photos'."
+                            showScreen(Screen.START)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(PtpConstants.TAG, "Error during PTP initialization", e)
+                        usbHostManager.disconnect()
+                        tvStartStatus.text = "Connection error during PTP setup.\nPlease reconnect USB."
                         showScreen(Screen.START)
                     }
                 }
             }
             is UsbConnectionState.Error -> {
+                initJob?.cancel()
                 tvStartStatus.text = state.message
                 showScreen(Screen.START)
             }
             is UsbConnectionState.Disconnected -> {
+                initJob?.cancel()
                 stopAndClearVideoPlayer()
                 photoLoadJob?.cancel()
                 videoCachingJob?.cancel()
                 thumbnailLoader.clear()
                 lifecycleScope.launch {
-                    repository.clear()
+                    try {
+                        repository.clear()
+                    } catch (_: Exception) {}
                 }
                 tvStartStatus.text = getString(R.string.phone_disconnected)
                 showScreen(Screen.START)
@@ -444,7 +463,7 @@ class PhotoAdapter(
 ) : RecyclerView.Adapter<PhotoViewHolder>() {
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PhotoViewHolder {
-        val view = View.inflate(parent.context, R.layout.item_photo, null)
+        val view = LayoutInflater.from(parent.context).inflate(R.layout.item_photo, parent, false)
         return PhotoViewHolder(view)
     }
 
@@ -472,7 +491,7 @@ class VideoAdapter(
 ) : RecyclerView.Adapter<VideoViewHolder>() {
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VideoViewHolder {
-        val view = View.inflate(parent.context, R.layout.item_video, null)
+        val view = LayoutInflater.from(parent.context).inflate(R.layout.item_video, parent, false)
         return VideoViewHolder(view)
     }
 

@@ -30,78 +30,69 @@ class PtpMediaRepository(private val context: Context) {
         get() = activeClient
 
     suspend fun initialize(ptpClient: PtpClient, fallbackName: String): Boolean = withContext(Dispatchers.IO) {
-        activeClient = ptpClient
-        photoItems.clear()
-        videoItems.clear()
+        try {
+            activeClient = ptpClient
+            photoItems.clear()
+            videoItems.clear()
 
-        Log.i(PtpConstants.TAG, "Initializing PTP Session...")
-        if (!ptpClient.openSession()) {
-            Log.e(PtpConstants.TAG, "Could not start PTP session")
-            return@withContext false
+            Log.i(PtpConstants.TAG, "Step 1: OpenSession...")
+            if (!ptpClient.openSession()) {
+                Log.e(PtpConstants.TAG, "OpenSession failed")
+                return@withContext false
+            }
+
+            // 1. Get Device Info
+            Log.i(PtpConstants.TAG, "Step 2: GetDeviceInfo...")
+            val devInfo = ptpClient.getDeviceInfo()
+            reportedDeviceName = if (devInfo != null && (devInfo.manufacturer.isNotBlank() || devInfo.model.isNotBlank())) {
+                "${devInfo.manufacturer} ${devInfo.model}".trim()
+            } else {
+                fallbackName
+            }
+            Log.i(PtpConstants.TAG, "PTP session opened. Device name: $reportedDeviceName")
+
+            // 2. Get Storage IDs
+            Log.i(PtpConstants.TAG, "Step 3: GetStorageIDs...")
+            val storageIds = ptpClient.getStorageIds()
+            val primaryStorageId = if (storageIds.isNotEmpty()) storageIds[0] else PtpConstants.STORAGE_ALL
+
+            // 3. Minimal media-handle discovery
+            Log.i(PtpConstants.TAG, "Step 4: Minimal media-handle discovery...")
+            discoverMediaHandles(ptpClient, primaryStorageId)
+
+            Log.i(PtpConstants.TAG, "PTP Ready: ${photoItems.size} photos, ${videoItems.size} videos")
+            true
+        } catch (e: Exception) {
+            Log.e(PtpConstants.TAG, "PTP initialization failed with exception", e)
+            false
         }
-
-        // 1. Get Device Info
-        val devInfo = ptpClient.getDeviceInfo()
-        reportedDeviceName = if (devInfo != null && (devInfo.manufacturer.isNotBlank() || devInfo.model.isNotBlank())) {
-            "${devInfo.manufacturer} ${devInfo.model}".trim()
-        } else {
-            fallbackName
-        }
-        Log.i(PtpConstants.TAG, "PTP session opened. Device name: $reportedDeviceName")
-
-        // 2. Discover Media Handles
-        discoverMediaHandles(ptpClient)
-
-        Log.i(PtpConstants.TAG, "PTP Ready: ${photoItems.size} photos, ${videoItems.size} videos")
-        true
     }
 
-    private suspend fun discoverMediaHandles(ptpClient: PtpClient) {
+    private suspend fun discoverMediaHandles(ptpClient: PtpClient, storageId: Int) {
         val foundPhotos = mutableSetOf<Int>()
         val foundVideos = mutableSetOf<Int>()
 
-        // Try format filtering first (fastest, 0 metadata overhead)
-        val imageFormats = intArrayOf(
-            PtpConstants.FORMAT_EXIF_JPEG,
-            PtpConstants.FORMAT_PNG,
-            PtpConstants.FORMAT_HEIF,
-            PtpConstants.FORMAT_WEBP,
-            PtpConstants.FORMAT_BMP,
-            PtpConstants.FORMAT_GIF
+        // 1. Try format filtering for JPEG (most common photo format)
+        val jpegHandles = ptpClient.getObjectHandles(
+            storageId = storageId,
+            formatCode = PtpConstants.FORMAT_EXIF_JPEG,
+            parentHandle = PtpConstants.PARENT_ALL
         )
-
-        for (fmt in imageFormats) {
-            val handles = ptpClient.getObjectHandles(
-                storageId = PtpConstants.STORAGE_ALL,
-                formatCode = fmt,
-                parentHandle = PtpConstants.PARENT_ALL
-            )
-            if (handles.isNotEmpty()) {
-                for (h in handles) foundPhotos.add(h)
-            }
+        if (jpegHandles.isNotEmpty()) {
+            for (h in jpegHandles) foundPhotos.add(h)
         }
 
-        val videoFormats = intArrayOf(
-            PtpConstants.FORMAT_MP4,
-            PtpConstants.FORMAT_3GP,
-            PtpConstants.FORMAT_MKV,
-            PtpConstants.FORMAT_MOV,
-            PtpConstants.FORMAT_AVI,
-            PtpConstants.FORMAT_WEBM
+        // 2. Try format filtering for MP4 (most common video format)
+        val mp4Handles = ptpClient.getObjectHandles(
+            storageId = storageId,
+            formatCode = PtpConstants.FORMAT_MP4,
+            parentHandle = PtpConstants.PARENT_ALL
         )
-
-        for (fmt in videoFormats) {
-            val handles = ptpClient.getObjectHandles(
-                storageId = PtpConstants.STORAGE_ALL,
-                formatCode = fmt,
-                parentHandle = PtpConstants.PARENT_ALL
-            )
-            if (handles.isNotEmpty()) {
-                for (h in handles) foundVideos.add(h)
-            }
+        if (mp4Handles.isNotEmpty()) {
+            for (h in mp4Handles) foundVideos.add(h)
         }
 
-        // If format filtering returned items, we are done without needing any full-scan!
+        // If format filtering returned items, we are done with only 2 quick queries!
         if (foundPhotos.isNotEmpty() || foundVideos.isNotEmpty()) {
             for (h in foundPhotos) {
                 photoItems.add(PtpMediaItem(handle = h, isVideo = false))
@@ -112,21 +103,21 @@ class PtpMediaRepository(private val context: Context) {
             return
         }
 
-        // If format filtering was not supported or returned nothing, query all handles
+        // If format filtering returned nothing (or format-filter unsupported by phone PTP stack),
+        // query all handles on storage
         Log.i(PtpConstants.TAG, "Format filtering returned no handles, querying all PTP handles")
         val allHandles = ptpClient.getObjectHandles(
-            storageId = PtpConstants.STORAGE_ALL,
+            storageId = storageId,
             formatCode = PtpConstants.FORMAT_ALL,
             parentHandle = PtpConstants.PARENT_ALL
         )
 
         Log.i(PtpConstants.TAG, "Total PTP handles retrieved: ${allHandles.size}")
 
-        // For low-end TV: If device returned all handles without format filter,
-        // we populate photos and videos by querying ObjectInfo lazily.
-        // Initially, we add all handles as photos (or check first few to separate).
-        for (h in allHandles) {
-            photoItems.add(PtpMediaItem(handle = h, isVideo = false))
+        // Protect low-end TV RAM: store up to 2000 handles
+        val count = allHandles.size.coerceAtMost(2000)
+        for (i in 0 until count) {
+            photoItems.add(PtpMediaItem(handle = allHandles[i], isVideo = false))
         }
     }
 

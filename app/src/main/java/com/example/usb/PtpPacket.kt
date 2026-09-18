@@ -50,19 +50,24 @@ object PtpPacket {
         return buffer.array()
     }
 
-    fun parseHeader(buffer: ByteBuffer): PtpHeader {
+    fun parseHeader(buffer: ByteBuffer): PtpHeader? {
+        if (buffer.remaining() < PtpConstants.HEADER_SIZE) return null
         buffer.order(ByteOrder.LITTLE_ENDIAN)
-        val length = buffer.getInt()
-        val type = buffer.getShort()
-        val code = buffer.getShort().toInt() and 0xFFFF
-        val transactionId = buffer.getInt()
-        return PtpHeader(length, type, code, transactionId)
+        return try {
+            val length = buffer.getInt()
+            val type = buffer.getShort()
+            val code = buffer.getShort().toInt() and 0xFFFF
+            val transactionId = buffer.getInt()
+            PtpHeader(length, type, code, transactionId)
+        } catch (e: Exception) {
+            null
+        }
     }
 
     fun parseResponse(buffer: ByteBuffer): PtpResponse {
-        val header = parseHeader(buffer)
+        val header = parseHeader(buffer) ?: return PtpResponse(PtpConstants.RESPONSE_GENERAL_ERROR, 0, IntArray(0))
         val remainingBytes = buffer.remaining()
-        val paramCount = remainingBytes / 4
+        val paramCount = (remainingBytes / 4).coerceAtLeast(0)
         val params = IntArray(paramCount)
         for (i in 0 until paramCount) {
             params[i] = buffer.getInt()
@@ -70,31 +75,80 @@ object PtpPacket {
         return PtpResponse(header.code, header.transactionId, params)
     }
 
+    /**
+     * Parse PTP String according to ISO 15740:
+     * - 1 byte character count (numChars, including null terminator)
+     * - followed by (numChars * 2) bytes of UTF-16LE characters
+     */
     fun parseString(buffer: ByteBuffer): String {
         if (!buffer.hasRemaining()) return ""
-        val charCount = buffer.get().toInt() and 0xFF
-        if (charCount == 0) return ""
-
-        val byteCount = (charCount - 1) * 2
-        if (buffer.remaining() < byteCount) return ""
-
-        val stringBytes = ByteArray(byteCount)
-        buffer.get(stringBytes)
-        // Skip null terminator (2 bytes in UTF-16LE)
-        if (buffer.remaining() >= 2) {
-            buffer.getShort()
+        val numChars = try {
+            buffer.get().toInt() and 0xFF
+        } catch (e: Exception) {
+            return ""
         }
-        return String(stringBytes, StandardCharsets.UTF_16LE)
+        if (numChars == 0) return ""
+
+        val totalBytes = numChars * 2
+        if (buffer.remaining() < totalBytes) {
+            // Not enough bytes remaining in buffer, consume safely without throwing
+            val skip = buffer.remaining()
+            buffer.position(buffer.position() + skip)
+            return ""
+        }
+
+        return try {
+            val stringBytes = ByteArray((numChars - 1) * 2)
+            if (stringBytes.isNotEmpty()) {
+                buffer.get(stringBytes)
+            }
+            // Discard 2-byte null terminator
+            buffer.getShort()
+            String(stringBytes, StandardCharsets.UTF_16LE)
+        } catch (e: Exception) {
+            ""
+        }
     }
 
+    /**
+     * Parse array of 16-bit unsigned integers (used in DeviceInfo for operations, events, formats)
+     * Format: 4-byte count (UINT32), followed by count * UINT16 elements.
+     */
+    fun parseUInt16Array(buffer: ByteBuffer): IntArray {
+        if (buffer.remaining() < 4) return IntArray(0)
+        return try {
+            val count = buffer.getInt()
+            if (count <= 0 || count > 5000 || buffer.remaining() < count * 2) {
+                return IntArray(0)
+            }
+            val result = IntArray(count)
+            for (i in 0 until count) {
+                result[i] = buffer.getShort().toInt() and 0xFFFF
+            }
+            result
+        } catch (e: Exception) {
+            IntArray(0)
+        }
+    }
+
+    /**
+     * Parse array of 32-bit unsigned integers (used for StorageIDs, ObjectHandles)
+     * Format: 4-byte count (UINT32), followed by count * UINT32 elements.
+     */
     fun parseUInt32Array(buffer: ByteBuffer): IntArray {
         if (buffer.remaining() < 4) return IntArray(0)
-        val count = buffer.getInt()
-        if (count <= 0 || buffer.remaining() < count * 4) return IntArray(0)
-        val result = IntArray(count)
-        for (i in 0 until count) {
-            result[i] = buffer.getInt()
+        return try {
+            val count = buffer.getInt()
+            if (count <= 0 || count > 50000 || buffer.remaining().toLong() < count.toLong() * 4) {
+                return IntArray(0)
+            }
+            val result = IntArray(count)
+            for (i in 0 until count) {
+                result[i] = buffer.getInt()
+            }
+            result
+        } catch (e: Exception) {
+            IntArray(0)
         }
-        return result
     }
 }
