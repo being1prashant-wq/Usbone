@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.util.Base64
 
 plugins {
   alias(libs.plugins.android.application)
@@ -7,6 +8,18 @@ plugins {
   alias(libs.plugins.roborazzi)
   alias(libs.plugins.secrets)
   alias(libs.plugins.google.services)
+}
+
+// Ensure debug.keystore exists before signing config evaluation (especially on CI / GitHub Actions)
+val debugKeystoreFile = file("${rootDir}/debug.keystore")
+if (!debugKeystoreFile.exists() || debugKeystoreFile.length() == 0L) {
+  val base64File = file("${rootDir}/debug.keystore.base64")
+  if (base64File.exists() && base64File.length() > 0L) {
+    try {
+      val decoded = Base64.getDecoder().decode(base64File.readText().trim())
+      debugKeystoreFile.writeBytes(decoded)
+    } catch (_: Throwable) {}
+  }
 }
 
 android {
