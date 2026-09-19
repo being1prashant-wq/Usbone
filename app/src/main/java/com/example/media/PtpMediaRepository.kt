@@ -8,6 +8,7 @@ import com.example.usb.PtpClient
 import com.example.usb.PtpConstants
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 
@@ -53,11 +54,11 @@ class PtpMediaRepository(private val context: Context) {
             // 2. Get Storage IDs
             Log.i(PtpConstants.TAG, "Step 3: GetStorageIDs...")
             val storageIds = ptpClient.getStorageIds()
-            val primaryStorageId = if (storageIds.isNotEmpty()) storageIds[0] else PtpConstants.STORAGE_ALL
+            Log.i(PtpConstants.TAG, "Retrieved ${storageIds.size} storage IDs")
 
-            // 3. Media discovery
-            Log.i(PtpConstants.TAG, "Step 4: Media discovery...")
-            discoverMedia(primaryStorageId)
+            // 3. Complete media discovery across all storages
+            Log.i(PtpConstants.TAG, "Step 4: Complete media discovery across all storages...")
+            discoverAllMedia(ptpClient, storageIds)
 
             Log.i(PtpConstants.TAG, "PTP Ready: ${photoItems.size} photos, ${videoItems.size} videos")
             true
@@ -67,64 +68,167 @@ class PtpMediaRepository(private val context: Context) {
         }
     }
 
-    suspend fun discoverMedia(storageId: Int = PtpConstants.STORAGE_ALL): Int = withContext(Dispatchers.IO) {
-        val ptpClient = activeClient ?: return@withContext 0
+    private suspend fun discoverAllMedia(ptpClient: PtpClient, storageIds: IntArray) {
+        val targetStorageIds = mutableListOf<Int>()
+        if (storageIds.isNotEmpty()) {
+            for (id in storageIds) {
+                targetStorageIds.add(id)
+            }
+        } else {
+            targetStorageIds.add(PtpConstants.STORAGE_ALL)
+        }
 
-        photoItems.clear()
-        videoItems.clear()
+        val visitedHandles = mutableSetOf<Int>()
+        val pendingHandles = ArrayDeque<Int>()
+        val visitedFolders = mutableSetOf<Int>()
 
-        val foundPhotos = mutableSetOf<Int>()
-        val foundVideos = mutableSetOf<Int>()
+        // 1. Initial handles collection across all storages
+        for (sId in targetStorageIds) {
+            Log.i(PtpConstants.TAG, "Querying initial handles for storage 0x${sId.toString(16)}...")
+            val storageRootHandles = mutableSetOf<Int>()
 
-        // 1. Quick JPEG format query
-        try {
-            val jpegHandles = ptpClient.getObjectHandles(
-                storageId = storageId,
-                formatCode = PtpConstants.FORMAT_EXIF_JPEG,
+            // Query root objects (parent = 0x00000000)
+            val hRoot = ptpClient.getObjectHandles(
+                storageId = sId,
+                formatCode = PtpConstants.FORMAT_ALL,
+                parentHandle = PtpConstants.PARENT_ROOT
+            )
+            for (h in hRoot) storageRootHandles.add(h)
+
+            // Query all objects (parent = 0xFFFFFFFF / -1)
+            val hAll = ptpClient.getObjectHandles(
+                storageId = sId,
+                formatCode = PtpConstants.FORMAT_ALL,
                 parentHandle = PtpConstants.PARENT_ALL
             )
-            for (h in jpegHandles) foundPhotos.add(h)
-        } catch (e: Exception) {
-            Log.w(PtpConstants.TAG, "Quick JPEG discovery error", e)
-        }
+            for (h in hAll) storageRootHandles.add(h)
 
-        // 2. Quick MP4 format query
-        try {
-            val mp4Handles = ptpClient.getObjectHandles(
-                storageId = storageId,
-                formatCode = PtpConstants.FORMAT_MP4,
-                parentHandle = PtpConstants.PARENT_ALL
-            )
-            for (h in mp4Handles) foundVideos.add(h)
-        } catch (e: Exception) {
-            Log.w(PtpConstants.TAG, "Quick MP4 discovery error", e)
-        }
-
-        for (h in foundPhotos) {
-            photoItems.add(PtpMediaItem(handle = h, isVideo = false))
-        }
-        for (h in foundVideos) {
-            videoItems.add(PtpMediaItem(handle = h, isVideo = true))
-        }
-
-        // 3. Fallback handle retrieval if both format queries returned nothing
-        if (foundPhotos.isEmpty() && foundVideos.isEmpty()) {
-            try {
-                val allHandles = ptpClient.getObjectHandles(
-                    storageId = storageId,
-                    formatCode = PtpConstants.FORMAT_ALL,
-                    parentHandle = PtpConstants.PARENT_ALL
+            // Fallback: If 0 handles were returned for FORMAT_ALL on this storage,
+            // query format-specific codes
+            if (storageRootHandles.isEmpty()) {
+                Log.w(PtpConstants.TAG, "FORMAT_ALL returned no handles on storage 0x${sId.toString(16)}, trying format fallbacks")
+                val fallbackFormats = intArrayOf(
+                    PtpConstants.FORMAT_EXIF_JPEG,
+                    PtpConstants.FORMAT_PNG,
+                    PtpConstants.FORMAT_MP4,
+                    PtpConstants.FORMAT_3GP,
+                    PtpConstants.FORMAT_MOV,
+                    PtpConstants.FORMAT_AVI,
+                    PtpConstants.FORMAT_MKV,
+                    PtpConstants.FORMAT_WEBM,
+                    PtpConstants.FORMAT_HEIF,
+                    PtpConstants.FORMAT_WEBP,
+                    PtpConstants.FORMAT_ASSOCIATION,
+                    PtpConstants.FORMAT_UNDEFINED
                 )
-                val count = allHandles.size.coerceAtMost(1000)
-                for (i in 0 until count) {
-                    photoItems.add(PtpMediaItem(handle = allHandles[i], isVideo = false))
+                for (fmt in fallbackFormats) {
+                    val hList0 = ptpClient.getObjectHandles(sId, fmt, PtpConstants.PARENT_ROOT)
+                    for (h in hList0) storageRootHandles.add(h)
+                    val hListAll = ptpClient.getObjectHandles(sId, fmt, PtpConstants.PARENT_ALL)
+                    for (h in hListAll) storageRootHandles.add(h)
                 }
-            } catch (e: Exception) {
-                Log.w(PtpConstants.TAG, "Fallback handle retrieval error", e)
+            }
+
+            Log.i(PtpConstants.TAG, "Storage 0x${sId.toString(16)} yielded ${storageRootHandles.size} initial handles")
+            for (h in storageRootHandles) {
+                if (h !in visitedHandles) {
+                    pendingHandles.add(h)
+                }
             }
         }
 
-        photoItems.size + videoItems.size
+        // If specific storage IDs yielded no handles at all, try STORAGE_ALL (-1)
+        if (pendingHandles.isEmpty() && !targetStorageIds.contains(PtpConstants.STORAGE_ALL)) {
+            Log.i(PtpConstants.TAG, "No handles found on specific storages, attempting STORAGE_ALL query...")
+            val allRoot = ptpClient.getObjectHandles(
+                storageId = PtpConstants.STORAGE_ALL,
+                formatCode = PtpConstants.FORMAT_ALL,
+                parentHandle = PtpConstants.PARENT_ROOT
+            )
+            val allAll = ptpClient.getObjectHandles(
+                storageId = PtpConstants.STORAGE_ALL,
+                formatCode = PtpConstants.FORMAT_ALL,
+                parentHandle = PtpConstants.PARENT_ALL
+            )
+            for (h in allRoot) {
+                if (h !in visitedHandles) pendingHandles.add(h)
+            }
+            for (h in allAll) {
+                if (h !in visitedHandles) pendingHandles.add(h)
+            }
+        }
+
+        Log.i(PtpConstants.TAG, "Total initial handles to process: ${pendingHandles.size}")
+
+        // 2. Breadth-first traversal of all handles and folders
+        while (pendingHandles.isNotEmpty()) {
+            val handle = pendingHandles.removeFirst()
+            if (handle in visitedHandles) continue
+            visitedHandles.add(handle)
+
+            val info = try {
+                ptpClient.getObjectInfo(handle)
+            } catch (e: Exception) {
+                Log.w(PtpConstants.TAG, "Exception getting ObjectInfo for handle $handle", e)
+                null
+            }
+
+            if (info == null) {
+                Log.w(PtpConstants.TAG, "Null ObjectInfo for handle $handle, continuing")
+                continue
+            }
+
+            // If it's a directory / folder association, traverse into it
+            if (info.isFolder) {
+                if (handle !in visitedFolders) {
+                    visitedFolders.add(handle)
+                    Log.d(PtpConstants.TAG, "Descending into folder '${info.filename}' (handle $handle, storage 0x${info.storageId.toString(16)})")
+                    val childHandles = ptpClient.getObjectHandles(
+                        storageId = if (info.storageId != 0) info.storageId else PtpConstants.STORAGE_ALL,
+                        formatCode = PtpConstants.FORMAT_ALL,
+                        parentHandle = handle
+                    )
+                    Log.d(PtpConstants.TAG, "Folder '${info.filename}' contains ${childHandles.size} child handles")
+                    for (ch in childHandles) {
+                        if (ch !in visitedHandles) {
+                            pendingHandles.add(ch)
+                        }
+                    }
+                }
+                continue
+            }
+
+            // Identify video or photo
+            if (info.isVideo) {
+                videoItems.add(
+                    PtpMediaItem(
+                        handle = handle,
+                        isVideo = true,
+                        filename = info.filename,
+                        sizeBytes = info.compressedSize,
+                        format = info.format,
+                        isMetadataLoaded = true
+                    )
+                )
+                Log.d(PtpConstants.TAG, "Discovered VIDEO: '${info.filename}' (handle $handle, size ${info.compressedSize} B, format 0x${info.format.toString(16)})")
+            } else if (info.isImage) {
+                photoItems.add(
+                    PtpMediaItem(
+                        handle = handle,
+                        isVideo = false,
+                        filename = info.filename,
+                        sizeBytes = info.compressedSize,
+                        format = info.format,
+                        isMetadataLoaded = true
+                    )
+                )
+                Log.d(PtpConstants.TAG, "Discovered PHOTO: '${info.filename}' (handle $handle, format 0x${info.format.toString(16)})")
+            } else {
+                Log.d(PtpConstants.TAG, "Ignored non-media object '${info.filename}' (handle $handle, format 0x${info.format.toString(16)})")
+            }
+        }
+
+        Log.i(PtpConstants.TAG, "Media discovery complete: ${photoItems.size} photos, ${videoItems.size} videos across ${visitedFolders.size} folders (${visitedHandles.size} total objects evaluated)")
     }
 
     suspend fun fetchMetadataIfNeeded(item: PtpMediaItem): PtpMediaItem = withContext(Dispatchers.IO) {
@@ -152,6 +256,7 @@ class PtpMediaRepository(private val context: Context) {
                 if (!success) return@withContext null
             }
 
+            // Decode dimensions
             val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(tempFile.absolutePath, boundsOpts)
 
@@ -160,7 +265,8 @@ class PtpMediaRepository(private val context: Context) {
                 inSampleSize = sampleSize
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
-            BitmapFactory.decodeFile(tempFile.absolutePath, decodeOpts)
+            val bitmap = BitmapFactory.decodeFile(tempFile.absolutePath, decodeOpts)
+            bitmap
         } catch (e: OutOfMemoryError) {
             Log.e(PtpConstants.TAG, "OOM loading full photo $handle", e)
             null

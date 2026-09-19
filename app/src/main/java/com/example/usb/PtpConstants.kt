@@ -49,9 +49,9 @@ object PtpConstants {
     const val PARENT_ROOT = 0x00000000
     const val PARENT_ALL = -1 // 0xFFFFFFFF
 
-    // Formats - Folders & Associations
+    // Formats - Generic
     const val FORMAT_UNDEFINED = 0x3000
-    const val FORMAT_ASSOCIATION = 0x3001
+    const val FORMAT_ASSOCIATION = 0x3001 // Directory / Folder
 
     // Formats - Images
     const val FORMAT_EXIF_JPEG = 0x3801
@@ -69,13 +69,14 @@ object PtpConstants {
     const val FORMAT_AVI = 0x300A
     const val FORMAT_MPEG = 0x300B
     const val FORMAT_ASF = 0x300C
+    const val FORMAT_UNDEFINED_VIDEO = 0xB980
     const val FORMAT_WMV = 0xB981
     const val FORMAT_MP4 = 0xB982
     const val FORMAT_3GP = 0xB983
     const val FORMAT_3G2 = 0xB984
     const val FORMAT_AVCHD = 0xB985
     const val FORMAT_ATSC_TS = 0xB986
-    const val FORMAT_DVM = 0xB987
+    const val FORMAT_DVB_TS = 0xB987
     const val FORMAT_MOV = 0xB988
     const val FORMAT_MKV = 0xBA05
     const val FORMAT_WEBM = 0xBA82
@@ -97,85 +98,64 @@ object PtpConstants {
         FORMAT_AVI,
         FORMAT_MPEG,
         FORMAT_ASF,
+        FORMAT_UNDEFINED_VIDEO,
         FORMAT_WMV,
         FORMAT_MP4,
         FORMAT_3GP,
         FORMAT_3G2,
         FORMAT_AVCHD,
         FORMAT_ATSC_TS,
-        FORMAT_DVM,
+        FORMAT_DVB_TS,
         FORMAT_MOV,
         FORMAT_MKV,
         FORMAT_WEBM
     )
 
     private val IMAGE_EXTENSIONS = setOf(
-        "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "tif", "tiff", "dng"
+        "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "tif", "tiff",
+        "svg", "ico", "dng", "raw", "cr2", "nef", "arw", "rw2", "orf"
     )
 
-    // Complete set of video extensions as requested:
-    // .mp4, .mkv, .avi, .mov, .m4v, .3gp, .3g2, .mpg, .mpeg, .ts, .m2ts, .mts,
-    // .webm, .flv, .f4v, .vob, .wmv, .asf, .ogv, .rm, .rmvb
-    val VIDEO_EXTENSIONS = setOf(
-        "mp4", "mkv", "avi", "mov", "m4v", "3gp", "3g2",
-        "mpg", "mpeg", "ts", "m2ts", "mts", "webm", "flv",
-        "f4v", "vob", "wmv", "asf", "ogv", "rm", "rmvb",
-        "divx", "mpe", "mpv", "m4p", "qt"
+    private val VIDEO_EXTENSIONS = setOf(
+        "mp4", "mkv", "mov", "avi", "3gp", "3g2", "webm", "ts", "m4v", "wmv", "mpg", "mpeg",
+        "flv", "vob", "ogv", "m2ts", "mts", "divx", "asf", "f4v", "rm", "rmvb", "wtv"
     )
 
-    fun isFolder(format: Int): Boolean = format == FORMAT_ASSOCIATION
+    fun isImageFormat(format: Int): Boolean =
+        format in IMAGE_FORMATS || (format in 0x3800..0x38FF) || (format in 0xB800..0xB8FF)
 
-    fun isImageFormat(format: Int): Boolean = format in IMAGE_FORMATS
-
-    fun isVideoFormat(format: Int): Boolean = (format in VIDEO_FORMATS) || (format in 0xB980..0xB98F)
+    fun isVideoFormat(format: Int): Boolean =
+        format in VIDEO_FORMATS || (format in 0xB980..0xB98F) || format == 0xBA05 || format == 0xBA82
 
     fun isImageExtension(name: String): Boolean {
-        val ext = name.substringAfterLast('.', "").lowercase()
+        val ext = name.substringAfterLast('.', "").lowercase().trim()
         return ext in IMAGE_EXTENSIONS
     }
 
     fun isVideoExtension(name: String): Boolean {
-        val ext = name.substringAfterLast('.', "").lowercase()
+        val ext = name.substringAfterLast('.', "").lowercase().trim()
         return ext in VIDEO_EXTENSIONS
     }
 
-    fun isVideoObject(format: Int, filename: String): Boolean {
-        if (isFolder(format)) return false
+    fun isVideo(format: Int, filename: String): Boolean {
+        if (format == FORMAT_ASSOCIATION) return false
         if (isVideoFormat(format)) return true
-        return isVideoExtension(filename)
+        if (isVideoExtension(filename)) return true
+        val lower = filename.lowercase().trim()
+        if (lower.startsWith("vid_") || lower.startsWith("mov_") || lower.contains("video")) {
+            return !isImageExtension(filename)
+        }
+        return false
     }
 
-    fun getMimeType(filename: String, format: Int = 0): String {
-        val ext = filename.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            "mp4", "m4v", "m4p" -> "video/mp4"
-            "mkv" -> "video/x-matroska"
-            "avi", "divx" -> "video/x-msvideo"
-            "mov", "qt" -> "video/quicktime"
-            "3gp" -> "video/3gpp"
-            "3g2" -> "video/3gpp2"
-            "webm" -> "video/webm"
-            "ts", "m2ts", "mts" -> "video/mp2t"
-            "mpg", "mpeg", "mpe", "mpv" -> "video/mpeg"
-            "wmv", "asf" -> "video/x-ms-wmv"
-            "flv", "f4v" -> "video/x-flv"
-            "vob" -> "video/dvd"
-            "ogv" -> "video/ogg"
-            "rm", "rmvb" -> "video/vnd.rn-realvideo"
-            else -> {
-                when (format) {
-                    FORMAT_MP4 -> "video/mp4"
-                    FORMAT_AVI -> "video/x-msvideo"
-                    FORMAT_MOV -> "video/quicktime"
-                    FORMAT_3GP -> "video/3gpp"
-                    FORMAT_3G2 -> "video/3gpp2"
-                    FORMAT_WMV -> "video/x-ms-wmv"
-                    FORMAT_MKV -> "video/x-matroska"
-                    FORMAT_WEBM -> "video/webm"
-                    FORMAT_MPEG -> "video/mpeg"
-                    else -> "video/*"
-                }
-            }
+    fun isPhoto(format: Int, filename: String): Boolean {
+        if (format == FORMAT_ASSOCIATION) return false
+        if (isImageFormat(format)) return true
+        if (isImageExtension(filename)) return true
+        val lower = filename.lowercase().trim()
+        if (lower.startsWith("img_") || lower.startsWith("photo_") || lower.startsWith("pano_")) {
+            return !isVideoExtension(filename)
         }
+        return false
     }
 }

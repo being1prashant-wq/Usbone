@@ -7,23 +7,6 @@
     <string name="videos">VIDEOS</string>
     <string name="btn_photos">[ PHOTOS ]</string>
     <string name="btn_videos">[ VIDEOS ]</string>
-    <string name="btn_folders">[ FOLDERS ]</string>
-    <string name="folders">FOLDERS (FTP)</string>
-    <string name="ftp_connect_title">FTP FOLDERS BROWSER</string>
-    <string name="ftp_connect_hint">Start FTP server on your phone (e.g. WiFi FTP Server or File Manager) and connect:</string>
-    <string name="btn_connect">[ CONNECT ]</string>
-    <string name="btn_disconnect">[ DISCONNECT ]</string>
-    <string name="copy_to_tv">[ Copy to TV ]</string>
-    <string name="move_to_tv">[ Move to TV ]</string>
-    <string name="play_video">[ Play Video ]</string>
-    <string name="choose_dest">Choose Destination on TV:</string>
-    <string name="dest_movies">Movies Folder</string>
-    <string name="dest_downloads">Downloads Folder</string>
-    <string name="dest_app_storage">App Local Storage</string>
-    <string name="copying_file">Copying file to TV...</string>
-    <string name="moving_file">Moving file to TV...</string>
-    <string name="transfer_success">Transfer completed successfully!</string>
-    <string name="transfer_cancelled">Transfer cancelled.</string>
     <string name="photo_item">Photo</string>
     <string name="video_item">Video</string>
     <string name="no_photos">No photos available through PTP.</string>
@@ -38,13 +21,4 @@
     <string name="permission_denied">USB permission denied.</string>
     <string name="ptp_mode_required">PTP mode required</string>
     <string name="session_failed">Could not start PTP session.</string>
-    <string name="scanning_videos">Scanning videos...</string>
-    <string name="videos_discovered">%1$d videos</string>
-    <string name="play_video_title">PLAY VIDEO</string>
-    <string name="play_in_directusb">[ Play in DirectUSB ]</string>
-    <string name="open_with_tv_player">[ Open with TV Video Player ]</string>
-    <string name="cancel">[ CANCEL ]</string>
-    <string name="preparing_video">Preparing video...</string>
-    <string name="retry">[ RETRY ]</string>
-    <string name="transfer_failed">Video transfer failed.</string>
 </resources>

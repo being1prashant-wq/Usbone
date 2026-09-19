@@ -6,7 +6,6 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -14,7 +13,6 @@ import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.coroutines.coroutineContext
 
 data class PtpDeviceInfo(
     val manufacturer: String,
@@ -35,19 +33,19 @@ data class PtpObjectInfo(
     val thumbPixHeight: Int,
     val imagePixWidth: Int,
     val imagePixHeight: Int,
-    val parentHandle: Int = 0,
-    val associationType: Short = 0,
+    val parentObject: Int = 0,
+    val associationType: Int = 0,
     val filename: String,
     val dateModified: String
 ) {
     val isFolder: Boolean
-        get() = PtpConstants.isFolder(format)
+        get() = format == PtpConstants.FORMAT_ASSOCIATION || associationType != 0
 
     val isImage: Boolean
-        get() = !isFolder && (PtpConstants.isImageFormat(format) || PtpConstants.isImageExtension(filename))
+        get() = !isFolder && PtpConstants.isPhoto(format, filename)
 
     val isVideo: Boolean
-        get() = !isFolder && PtpConstants.isVideoObject(format, filename)
+        get() = !isFolder && PtpConstants.isVideo(format, filename)
 }
 
 class PtpClient(
@@ -64,9 +62,6 @@ class PtpClient(
 
     var deviceInfo: PtpDeviceInfo? = null
         private set
-
-    val supportsPartialObject64: Boolean
-        get() = deviceInfo?.operationsSupported?.contains(PtpConstants.OPERATION_GET_PARTIAL_OBJECT_64) == true
 
     private fun nextTransactionId(): Int {
         val id = transactionCounter.getAndIncrement()
@@ -204,67 +199,113 @@ class PtpClient(
                     )
                 }
 
-                val totalContainerLength = header.length
-                if (totalContainerLength < PtpConstants.HEADER_SIZE) {
-                    Log.e(PtpConstants.TAG, "Invalid totalContainerLength: $totalContainerLength")
+                val totalContainerLengthLong = header.length.toLong() and 0xFFFFFFFFL
+                val isIndeterminate = (totalContainerLengthLong == 0xFFFFFFFFL)
+
+                if (!isIndeterminate && totalContainerLengthLong < PtpConstants.HEADER_SIZE) {
+                    Log.e(PtpConstants.TAG, "Invalid totalContainerLength: $totalContainerLengthLong")
                     return@withContext Pair(
                         PtpResponse(PtpConstants.RESPONSE_GENERAL_ERROR, tid, IntArray(0)),
                         null
                     )
                 }
 
-                val payloadLength = totalContainerLength - PtpConstants.HEADER_SIZE
-                // Cap in-memory data payload to 8MB to prevent TV OOM
-                if (payloadLength > 8 * 1024 * 1024) {
-                    Log.e(PtpConstants.TAG, "Payload exceeds 8MB cap: $payloadLength")
+                val payloadLength = if (isIndeterminate) -1 else (totalContainerLengthLong - PtpConstants.HEADER_SIZE).toInt()
+                // Cap in-memory data payload to 16MB to prevent TV OOM
+                if (payloadLength > 16 * 1024 * 1024) {
+                    Log.e(PtpConstants.TAG, "Payload exceeds cap: $payloadLength")
                     return@withContext Pair(
                         PtpResponse(PtpConstants.RESPONSE_GENERAL_ERROR, tid, IntArray(0)),
                         null
                     )
                 }
 
-                val payload = ByteArray(payloadLength)
-                val availablePayloadInFirstRead = (firstRead - PtpConstants.HEADER_SIZE).coerceAtLeast(0)
-                val initialBytesToCopy = availablePayloadInFirstRead.coerceAtMost(payloadLength)
-                if (initialBytesToCopy > 0) {
-                    System.arraycopy(initialBuffer, PtpConstants.HEADER_SIZE, payload, 0, initialBytesToCopy)
-                }
+                val payload: ByteArray
+                var responseFound: PtpResponse? = null
 
-                var bytesRead = initialBytesToCopy
-                val chunk = ByteArray(16384)
-                while (bytesRead < payloadLength) {
-                    val toRead = (payloadLength - bytesRead).coerceAtMost(chunk.size)
-                    val readChunk = safeBulkTransfer(bulkIn, chunk, toRead, usbTimeout)
-                    if (readChunk <= 0) {
-                        Log.e(PtpConstants.TAG, "executeDataCommand: timeout reading payload ($bytesRead / $payloadLength)")
-                        break
+                if (isIndeterminate) {
+                    val stream = java.io.ByteArrayOutputStream()
+                    val initialBytes = firstRead - PtpConstants.HEADER_SIZE
+                    if (initialBytes > 0) {
+                        stream.write(initialBuffer, PtpConstants.HEADER_SIZE, initialBytes)
                     }
-                    System.arraycopy(chunk, 0, payload, bytesRead, readChunk)
-                    bytesRead += readChunk
-                }
-
-                // Check if the response container was already received in initialBuffer
-                val leftoverInFirstRead = firstRead - totalContainerLength
-                if (leftoverInFirstRead >= PtpConstants.HEADER_SIZE) {
-                    val respBb = ByteBuffer.wrap(initialBuffer, totalContainerLength, leftoverInFirstRead)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                    val respHeader = PtpPacket.parseHeader(respBb)
-                    if (respHeader != null && respHeader.type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
-                        val pCount = ((leftoverInFirstRead - PtpConstants.HEADER_SIZE) / 4)
-                            .coerceAtMost(respBb.remaining() / 4)
-                        val respParams = IntArray(pCount)
-                        for (i in 0 until pCount) {
-                            respParams[i] = respBb.getInt()
+                    val chunk = ByteArray(16384)
+                    while (stream.size() < 16 * 1024 * 1024) {
+                        val r = safeBulkTransfer(bulkIn, chunk, chunk.size, usbTimeout)
+                        if (r <= 0) break
+                        val chunkBb = ByteBuffer.wrap(chunk, 0, r).order(ByteOrder.LITTLE_ENDIAN)
+                        val chunkHdr = PtpPacket.parseHeader(chunkBb)
+                        if (chunkHdr != null && chunkHdr.type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
+                            val pCount = ((r - PtpConstants.HEADER_SIZE) / 4).coerceAtMost(chunkBb.remaining() / 4)
+                            val respParams = IntArray(pCount)
+                            for (i in 0 until pCount) {
+                                respParams[i] = chunkBb.getInt()
+                            }
+                            responseFound = PtpResponse(chunkHdr.code, chunkHdr.transactionId, respParams)
+                            break
                         }
-                        return@withContext Pair(
-                            PtpResponse(respHeader.code, respHeader.transactionId, respParams),
-                            payload
-                        )
+                        stream.write(chunk, 0, r)
+                        if (r < chunk.size) break
+                    }
+                    payload = stream.toByteArray()
+                } else {
+                    payload = ByteArray(payloadLength)
+                    val availablePayloadInFirstRead = (firstRead - PtpConstants.HEADER_SIZE).coerceAtLeast(0)
+                    val initialBytesToCopy = availablePayloadInFirstRead.coerceAtMost(payloadLength)
+                    if (initialBytesToCopy > 0) {
+                        System.arraycopy(initialBuffer, PtpConstants.HEADER_SIZE, payload, 0, initialBytesToCopy)
+                    }
+
+                    var bytesRead = initialBytesToCopy
+                    val chunk = ByteArray(16384)
+                    while (bytesRead < payloadLength) {
+                        val readChunk = safeBulkTransfer(bulkIn, chunk, chunk.size, usbTimeout)
+                        if (readChunk <= 0) {
+                            Log.e(PtpConstants.TAG, "executeDataCommand: timeout reading payload ($bytesRead / $payloadLength)")
+                            break
+                        }
+                        val toCopy = readChunk.coerceAtMost(payloadLength - bytesRead)
+                        System.arraycopy(chunk, 0, payload, bytesRead, toCopy)
+                        bytesRead += toCopy
+
+                        if (readChunk > toCopy) {
+                            val leftover = readChunk - toCopy
+                            if (leftover >= PtpConstants.HEADER_SIZE) {
+                                val respBb = ByteBuffer.wrap(chunk, toCopy, leftover).order(ByteOrder.LITTLE_ENDIAN)
+                                val respHeader = PtpPacket.parseHeader(respBb)
+                                if (respHeader != null && respHeader.type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
+                                    val pCount = ((leftover - PtpConstants.HEADER_SIZE) / 4).coerceAtMost(respBb.remaining() / 4)
+                                    val respParams = IntArray(pCount)
+                                    for (i in 0 until pCount) {
+                                        respParams[i] = respBb.getInt()
+                                    }
+                                    responseFound = PtpResponse(respHeader.code, respHeader.transactionId, respParams)
+                                }
+                            }
+                        }
+                    }
+
+                    // Check if the response container was already received in initialBuffer
+                    if (responseFound == null) {
+                        val leftoverInFirstRead = firstRead - totalContainerLengthLong.toInt()
+                        if (leftoverInFirstRead >= PtpConstants.HEADER_SIZE) {
+                            val respBb = ByteBuffer.wrap(initialBuffer, totalContainerLengthLong.toInt(), leftoverInFirstRead)
+                                .order(ByteOrder.LITTLE_ENDIAN)
+                            val respHeader = PtpPacket.parseHeader(respBb)
+                            if (respHeader != null && respHeader.type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
+                                val pCount = ((leftoverInFirstRead - PtpConstants.HEADER_SIZE) / 4)
+                                    .coerceAtMost(respBb.remaining() / 4)
+                                val respParams = IntArray(pCount)
+                                for (i in 0 until pCount) {
+                                    respParams[i] = respBb.getInt()
+                                }
+                                responseFound = PtpResponse(respHeader.code, respHeader.transactionId, respParams)
+                            }
+                        }
                     }
                 }
 
-                // Otherwise read response container from Bulk IN
-                val finalResp = readResponse(tid)
+                val finalResp = responseFound ?: readResponse(tid)
                 Pair(finalResp, payload)
             } catch (e: Exception) {
                 Log.e(PtpConstants.TAG, "Exception in executeDataCommand op=0x${opCode.toString(16)}", e)
@@ -275,16 +316,9 @@ class PtpClient(
 
     /**
      * Stream an object directly to an OutputStream (e.g. temporary cache file).
-     * Avoids loading large files into RAM by using a bounded buffer (512 KB).
-     * Uses 64-bit Long values internally for sizes and counters.
-     * Supports cancellation and progress updates.
+     * Avoids loading large files into RAM. Handles files > 2GB using unsigned length.
      */
-    suspend fun streamObject(
-        handle: Int,
-        outputStream: OutputStream,
-        expectedSize: Long = 0L,
-        onProgress: ((bytesTransferred: Long, totalBytes: Long) -> Unit)? = null
-    ): Boolean = mutex.withLock {
+    suspend fun streamObject(handle: Int, outputStream: OutputStream): Boolean = mutex.withLock {
         withContext(Dispatchers.IO) {
             val tid = nextTransactionId()
             try {
@@ -292,8 +326,7 @@ class PtpClient(
                     return@withContext false
                 }
 
-                // 512 KB bounded buffer: optimal speed on TV without RAM pressure
-                val buffer = ByteArray(512 * 1024)
+                val buffer = ByteArray(16384)
                 val firstRead = safeBulkTransfer(bulkIn, buffer, buffer.size, usbTimeout)
                 if (firstRead < PtpConstants.HEADER_SIZE) return@withContext false
 
@@ -306,57 +339,43 @@ class PtpClient(
                 }
                 if (header.type != PtpConstants.CONTAINER_TYPE_DATA) return@withContext false
 
-                // 32-bit unsigned length from header. 0xFFFFFFFF means indeterminate / >4GB
-                val rawHeaderLength = header.length.toLong() and 0xFFFFFFFFL
-                val totalPayload: Long = if (rawHeaderLength == 0xFFFFFFFFL || rawHeaderLength < PtpConstants.HEADER_SIZE) {
-                    if (expectedSize > 0) expectedSize else -1L
-                } else {
-                    rawHeaderLength - PtpConstants.HEADER_SIZE
-                }
+                val totalContainerLength = header.length.toLong() and 0xFFFFFFFFL
+                val isIndeterminate = (totalContainerLength == 0xFFFFFFFFL)
+                val totalPayload = if (isIndeterminate) -1L else totalContainerLength - PtpConstants.HEADER_SIZE
+                if (!isIndeterminate && totalPayload < 0) return@withContext false
 
                 var written: Long = 0L
-                val initialBytes = (firstRead - PtpConstants.HEADER_SIZE).coerceAtLeast(0)
+                val initialBytes = firstRead - PtpConstants.HEADER_SIZE
                 if (initialBytes > 0) {
-                    val toWrite = if (totalPayload > 0) {
-                        initialBytes.toLong().coerceAtMost(totalPayload).toInt()
-                    } else {
-                        initialBytes
-                    }
-                    outputStream.write(buffer, PtpConstants.HEADER_SIZE, toWrite)
+                    val toWrite = if (isIndeterminate) initialBytes.toLong() else initialBytes.toLong().coerceAtMost(totalPayload)
+                    outputStream.write(buffer, PtpConstants.HEADER_SIZE, toWrite.toInt())
                     written += toWrite
-                    onProgress?.invoke(written, totalPayload)
                 }
 
-                while (coroutineContext.isActive) {
-                    if (totalPayload > 0 && written >= totalPayload) {
-                        break
-                    }
-                    val toRead = if (totalPayload > 0) {
-                        ((totalPayload - written).coerceAtMost(buffer.size.toLong())).toInt()
-                    } else {
-                        buffer.size
-                    }
-                    val r = safeBulkTransfer(bulkIn, buffer, toRead, usbTimeout)
+                while (isIndeterminate || written < totalPayload) {
+                    val r = safeBulkTransfer(bulkIn, buffer, buffer.size, usbTimeout)
                     if (r <= 0) {
-                        if (totalPayload > 0 && written < totalPayload) {
-                            Log.e(PtpConstants.TAG, "streamObject: transfer stopped early at $written / $totalPayload bytes")
+                        if (!isIndeterminate) {
+                            Log.e(PtpConstants.TAG, "streamObject: transfer halted at $written / $totalPayload bytes")
                             return@withContext false
                         }
                         break
                     }
-                    outputStream.write(buffer, 0, r)
-                    written += r
-                    onProgress?.invoke(written, totalPayload)
+                    val toWrite = if (isIndeterminate) r.toLong() else r.toLong().coerceAtMost(totalPayload - written)
+                    outputStream.write(buffer, 0, toWrite.toInt())
+                    written += toWrite
+                    if (isIndeterminate && r < buffer.size) {
+                        break
+                    }
                 }
 
                 outputStream.flush()
-                if (!coroutineContext.isActive) return@withContext false
 
-                // If response container was included in the first read after data
-                if (rawHeaderLength != 0xFFFFFFFFL) {
-                    val leftover = firstRead - header.length
+                // If response container was in the first read after data
+                if (!isIndeterminate) {
+                    val leftover = firstRead - totalContainerLength.toInt()
                     if (leftover >= PtpConstants.HEADER_SIZE) {
-                        val respBb = ByteBuffer.wrap(buffer, header.length, leftover).order(ByteOrder.LITTLE_ENDIAN)
+                        val respBb = ByteBuffer.wrap(buffer, totalContainerLength.toInt(), leftover).order(ByteOrder.LITTLE_ENDIAN)
                         val respHeader = PtpPacket.parseHeader(respBb)
                         if (respHeader != null && respHeader.type == PtpConstants.CONTAINER_TYPE_RESPONSE) {
                             return@withContext (respHeader.code == PtpConstants.RESPONSE_OK)
@@ -365,7 +384,7 @@ class PtpClient(
                 }
 
                 val resp = readResponse(tid)
-                resp.isOk || written > 0
+                resp.isOk
             } catch (e: Exception) {
                 Log.e(PtpConstants.TAG, "Exception streaming object $handle", e)
                 false
@@ -514,11 +533,11 @@ class PtpClient(
             val thumbPixHeight = bb.getInt()
             val imagePixWidth = bb.getInt()
             val imagePixHeight = bb.getInt()
-            val imageBitDepth = bb.getInt()
+            bb.getInt() // imageBitDepth
             val parentObject = bb.getInt()
-            val associationType = bb.getShort()
-            val associationDesc = bb.getInt()
-            val sequenceNumber = bb.getInt()
+            val associationType = bb.getShort().toInt() and 0xFFFF
+            bb.getInt() // associationDesc
+            bb.getInt() // sequenceNumber
 
             val filename = PtpPacket.parseString(bb)
             PtpPacket.parseString(bb) // dateCreated
@@ -535,7 +554,7 @@ class PtpClient(
                 thumbPixHeight = thumbPixHeight,
                 imagePixWidth = imagePixWidth,
                 imagePixHeight = imagePixHeight,
-                parentHandle = parentObject,
+                parentObject = parentObject,
                 associationType = associationType,
                 filename = filename,
                 dateModified = dateModified
@@ -574,23 +593,6 @@ class PtpClient(
                 null
             }
         }
-    }
-
-    /**
-     * Get Partial Object data using 64-bit offset (MTP 1.1 OPERATION_GET_PARTIAL_OBJECT_64).
-     * Used for chunked reads of large video files (> 500MB, 2GB+).
-     */
-    suspend fun getPartialObject64(handle: Int, offset: Long, maxBytes: Int): ByteArray? {
-        val offsetLow = (offset and 0xFFFFFFFFL).toInt()
-        val offsetHigh = ((offset ushr 32) and 0xFFFFFFFFL).toInt()
-        val (resp, payload) = executeDataCommand(
-            PtpConstants.OPERATION_GET_PARTIAL_OBJECT_64,
-            handle,
-            offsetLow,
-            offsetHigh,
-            maxBytes
-        )
-        return if (resp.isOk && payload != null) payload else null
     }
 
     /**

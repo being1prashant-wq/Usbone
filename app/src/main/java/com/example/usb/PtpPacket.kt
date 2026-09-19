@@ -138,10 +138,11 @@ object PtpPacket {
     fun parseUInt32Array(buffer: ByteBuffer): IntArray {
         if (buffer.remaining() < 4) return IntArray(0)
         return try {
-            val count = buffer.getInt()
-            if (count <= 0 || count > 50000 || buffer.remaining().toLong() < count.toLong() * 4) {
-                return IntArray(0)
-            }
+            val countRaw = buffer.getInt()
+            if (countRaw <= 0) return IntArray(0)
+            val available = buffer.remaining() / 4
+            val count = countRaw.coerceAtMost(available)
+            if (count <= 0) return IntArray(0)
             val result = IntArray(count)
             for (i in 0 until count) {
                 result[i] = buffer.getInt()
