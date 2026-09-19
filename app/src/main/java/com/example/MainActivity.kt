@@ -1,5 +1,6 @@
 package com.example
 
+import android.content.Intent
 import android.graphics.Bitmap
 import android.media.MediaPlayer
 import android.os.Bundle
@@ -14,8 +15,10 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import android.widget.VideoView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -31,6 +34,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 enum class Screen {
     START,
@@ -81,13 +85,38 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rvVideos: RecyclerView
     private lateinit var tvVideosCount: TextView
     private lateinit var tvEmptyVideos: TextView
+    private lateinit var layoutVideoScanning: View
+    private lateinit var tvVideoScanningStatus: TextView
     private lateinit var videoAdapter: VideoAdapter
 
     // Video Player Views
     private lateinit var videoView: VideoView
     private lateinit var layoutVideoBuffering: View
     private lateinit var tvVideoError: TextView
+
+    // Video Selection Dialog Views
+    private lateinit var layoutVideoOptionsDialog: View
+    private lateinit var tvDialogVideoTitle: TextView
+    private lateinit var tvDialogVideoMeta: TextView
+    private lateinit var btnPlayDirectusb: Button
+    private lateinit var btnPlayExternal: Button
+    private lateinit var btnCancelPlay: Button
+
+    // Video Preparation Dialog Views
+    private lateinit var layoutVideoPrepDialog: View
+    private lateinit var tvPrepTitle: TextView
+    private lateinit var tvPrepFilename: TextView
+    private lateinit var progressVideoPrep: ProgressBar
+    private lateinit var tvPrepStatus: TextView
+    private lateinit var tvPrepError: TextView
+    private lateinit var btnPrepRetry: Button
+    private lateinit var btnPrepCancel: Button
+
+    private var selectedVideoItem: PtpMediaItem? = null
+    private var isCurrentPrepExternal: Boolean = false
     private var videoCachingJob: Job? = null
+    private var videoScanJob: Job? = null
+    private var initJob: Job? = null
 
     private var currentScreen: Screen = Screen.START
 
@@ -138,12 +167,63 @@ class MainActivity : AppCompatActivity() {
         rvVideos = findViewById(R.id.rv_videos)
         tvVideosCount = findViewById(R.id.tv_videos_count)
         tvEmptyVideos = findViewById(R.id.tv_empty_videos)
+        layoutVideoScanning = findViewById(R.id.layout_video_scanning)
+        tvVideoScanningStatus = findViewById(R.id.tv_video_scanning_status)
         rvVideos.layoutManager = GridLayoutManager(this, 4)
 
         // Video Player
         videoView = findViewById(R.id.video_view)
         layoutVideoBuffering = findViewById(R.id.layout_video_buffering)
         tvVideoError = findViewById(R.id.tv_video_error)
+
+        // Video Selection Dialog
+        layoutVideoOptionsDialog = findViewById(R.id.layout_video_options_dialog)
+        tvDialogVideoTitle = findViewById(R.id.tv_dialog_video_title)
+        tvDialogVideoMeta = findViewById(R.id.tv_dialog_video_meta)
+        btnPlayDirectusb = findViewById(R.id.btn_play_directusb)
+        btnPlayExternal = findViewById(R.id.btn_play_external)
+        btnCancelPlay = findViewById(R.id.btn_cancel_play)
+
+        btnPlayDirectusb.setOnClickListener {
+            layoutVideoOptionsDialog.visibility = View.GONE
+            selectedVideoItem?.let { item ->
+                prepareAndPlayVideo(item, isExternal = false)
+            }
+        }
+
+        btnPlayExternal.setOnClickListener {
+            layoutVideoOptionsDialog.visibility = View.GONE
+            selectedVideoItem?.let { item ->
+                prepareAndPlayVideo(item, isExternal = true)
+            }
+        }
+
+        btnCancelPlay.setOnClickListener {
+            layoutVideoOptionsDialog.visibility = View.GONE
+            rvVideos.requestFocus()
+        }
+
+        // Video Preparation Dialog
+        layoutVideoPrepDialog = findViewById(R.id.layout_video_prep_dialog)
+        tvPrepTitle = findViewById(R.id.tv_prep_title)
+        tvPrepFilename = findViewById(R.id.tv_prep_filename)
+        progressVideoPrep = findViewById(R.id.progress_video_prep)
+        tvPrepStatus = findViewById(R.id.tv_prep_status)
+        tvPrepError = findViewById(R.id.tv_prep_error)
+        btnPrepRetry = findViewById(R.id.btn_prep_retry)
+        btnPrepCancel = findViewById(R.id.btn_prep_cancel)
+
+        btnPrepRetry.setOnClickListener {
+            tvPrepError.visibility = View.GONE
+            btnPrepRetry.visibility = View.GONE
+            selectedVideoItem?.let { item ->
+                prepareAndPlayVideo(item, isExternal = isCurrentPrepExternal)
+            }
+        }
+
+        btnPrepCancel.setOnClickListener {
+            cancelVideoPreparation()
+        }
     }
 
     private fun initServices() {
@@ -169,12 +249,15 @@ class MainActivity : AppCompatActivity() {
                 lifecycleScope.launch {
                     val updated = repository.fetchMetadataIfNeeded(item)
                     if (updated.isMetadataLoaded) {
-                        videoAdapter.notifyItemChanged(repository.videoItems.indexOf(item))
+                        val pos = repository.videoItems.indexOf(item)
+                        if (pos >= 0) {
+                            videoAdapter.notifyItemChanged(pos)
+                        }
                     }
                 }
             },
             onItemClicked = { item ->
-                startVideoPlayback(item)
+                showVideoOptionsDialog(item)
             }
         )
         rvVideos.adapter = videoAdapter
@@ -182,41 +265,26 @@ class MainActivity : AppCompatActivity() {
         usbHostManager = UsbHostManager(this) { state ->
             handleUsbState(state)
         }
-    }
-
-    override fun onStart() {
-        super.onStart()
         usbHostManager.start()
     }
 
-    override fun onStop() {
-        super.onStop()
-        stopAndClearVideoPlayer()
-        photoLoadJob?.cancel()
-        videoCachingJob?.cancel()
-        thumbnailLoader.clear()
-        usbHostManager.stop()
+    override fun onResume() {
+        super.onResume()
+        try {
+            videoCacheManager.pruneSharedCache()
+        } catch (_: Exception) {}
     }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        videoCacheManager.clearCache()
-        lifecycleScope.launch {
-            repository.clear()
-        }
-    }
-
-    private var initJob: kotlinx.coroutines.Job? = null
 
     private fun handleUsbState(state: UsbConnectionState) {
         when (state) {
             is UsbConnectionState.Idle -> {
                 initJob?.cancel()
-                tvStartStatus.text = ""
+                tvStartStatus.text = getString(R.string.connect_phone)
                 showScreen(Screen.START)
             }
             is UsbConnectionState.DeviceAttached -> {
-                tvStartStatus.text = getString(R.string.ptp_device_detected)
+                initJob?.cancel()
+                tvStartStatus.text = "Device connected: ${state.device.deviceName}\nRequesting permission..."
             }
             is UsbConnectionState.PermissionRequired -> {
                 tvStartStatus.text = getString(R.string.permission_required)
@@ -237,6 +305,7 @@ class MainActivity : AppCompatActivity() {
                             updateMediaCounts()
                             showScreen(Screen.HOME)
                             btnPhotos.requestFocus()
+                            startVideoDiscovery()
                         } else {
                             usbHostManager.disconnect()
                             tvStartStatus.text = "PTP initialization failed.\nPlease check phone USB mode is set to 'PTP / Transfer photos'."
@@ -257,18 +326,42 @@ class MainActivity : AppCompatActivity() {
             }
             is UsbConnectionState.Disconnected -> {
                 initJob?.cancel()
+                videoScanJob?.cancel()
+                cancelVideoPreparation()
                 stopAndClearVideoPlayer()
                 photoLoadJob?.cancel()
-                videoCachingJob?.cancel()
                 thumbnailLoader.clear()
                 lifecycleScope.launch {
                     try {
                         repository.clear()
                     } catch (_: Exception) {}
                 }
+                layoutVideoOptionsDialog.visibility = View.GONE
+                layoutVideoPrepDialog.visibility = View.GONE
+                layoutVideoScanning.visibility = View.GONE
                 tvStartStatus.text = getString(R.string.phone_disconnected)
                 showScreen(Screen.START)
             }
+        }
+    }
+
+    private fun startVideoDiscovery() {
+        videoScanJob?.cancel()
+        videoScanJob = lifecycleScope.launch {
+            layoutVideoScanning.visibility = View.VISIBLE
+            tvVideoScanningStatus.text = getString(R.string.scanning_videos)
+
+            repository.scanAllVideos { foundCount, isDone ->
+                lifecycleScope.launch(Dispatchers.Main) {
+                    updateMediaCounts()
+                    if (isDone) {
+                        layoutVideoScanning.visibility = View.GONE
+                    }
+                }
+            }
+
+            layoutVideoScanning.visibility = View.GONE
+            updateMediaCounts()
         }
     }
 
@@ -322,54 +415,169 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun startVideoPlayback(item: PtpMediaItem) {
-        val client = repository.client ?: return
-        showScreen(Screen.VIDEO_PLAYER)
+    private fun showVideoOptionsDialog(item: PtpMediaItem) {
+        selectedVideoItem = item
+        tvDialogVideoTitle.text = item.displayName
+        tvDialogVideoMeta.text = if (item.sizeBytes > 0) item.formattedSize else ""
+        layoutVideoOptionsDialog.visibility = View.VISIBLE
+        btnPlayDirectusb.requestFocus()
+    }
 
-        videoView.visibility = View.GONE
-        tvVideoError.visibility = View.GONE
-        layoutVideoBuffering.visibility = View.VISIBLE
+    private fun prepareAndPlayVideo(item: PtpMediaItem, isExternal: Boolean) {
+        val client = repository.client ?: return
+        isCurrentPrepExternal = isExternal
+
+        layoutVideoPrepDialog.visibility = View.VISIBLE
+        tvPrepTitle.text = getString(R.string.preparing_video)
+        tvPrepFilename.text = item.displayName
+        progressVideoPrep.progress = 0
+        progressVideoPrep.isIndeterminate = (item.sizeBytes <= 0)
+        tvPrepStatus.text = if (item.sizeBytes > 0) "0 MB / ${item.formattedSize}" else "0 MB"
+        tvPrepError.visibility = View.GONE
+        btnPrepRetry.visibility = View.GONE
+        btnPrepCancel.requestFocus()
 
         videoCachingJob?.cancel()
         videoCachingJob = lifecycleScope.launch {
-            val file = videoCacheManager.cacheVideo(client, item.handle)
-            if (file != null && file.exists()) {
-                videoView.visibility = View.VISIBLE
-                videoView.setVideoPath(file.absolutePath)
-                videoView.setOnPreparedListener { mp ->
-                    layoutVideoBuffering.visibility = View.GONE
-                    mp.isLooping = false
-                    videoView.start()
+            val cachedFile = videoCacheManager.cacheVideo(
+                client = client,
+                item = item,
+                isForExternalShare = isExternal
+            ) { transferred, total ->
+                lifecycleScope.launch(Dispatchers.Main) {
+                    if (total > 0) {
+                        val pct = ((transferred * 100) / total).toInt().coerceIn(0, 100)
+                        progressVideoPrep.isIndeterminate = false
+                        progressVideoPrep.progress = pct
+                        val mbTransferred = transferred / (1024.0 * 1024.0)
+                        val mbTotal = total / (1024.0 * 1024.0)
+                        tvPrepStatus.text = String.format("%.1f MB / %.1f MB (%d%%)", mbTransferred, mbTotal, pct)
+                    } else {
+                        progressVideoPrep.isIndeterminate = true
+                        val mbTransferred = transferred / (1024.0 * 1024.0)
+                        tvPrepStatus.text = String.format("%.1f MB transferred", mbTransferred)
+                    }
                 }
-                videoView.setOnErrorListener { _, what, extra ->
-                    Log.e(PtpConstants.TAG, "VideoView playback error: what=$what extra=$extra")
-                    layoutVideoBuffering.visibility = View.GONE
-                    tvVideoError.visibility = View.VISIBLE
-                    true
-                }
-                videoView.setOnCompletionListener {
-                    // Finished playing
+            }
+
+            if (cachedFile != null && cachedFile.exists()) {
+                layoutVideoPrepDialog.visibility = View.GONE
+                if (isExternal) {
+                    launchExternalVideoPlayer(cachedFile, item)
+                } else {
+                    playVideoLocally(cachedFile)
                 }
             } else {
-                layoutVideoBuffering.visibility = View.GONE
-                tvVideoError.text = getString(R.string.video_load_failed)
-                tvVideoError.visibility = View.VISIBLE
+                progressVideoPrep.progress = 0
+                tvPrepError.visibility = View.VISIBLE
+                tvPrepError.text = getString(R.string.transfer_failed)
+                btnPrepRetry.visibility = View.VISIBLE
+                btnPrepRetry.requestFocus()
             }
         }
     }
 
-    private fun stopAndClearVideoPlayer() {
+    private fun cancelVideoPreparation() {
         videoCachingJob?.cancel()
-        if (videoView.isPlaying) {
-            videoView.stopPlayback()
+        layoutVideoPrepDialog.visibility = View.GONE
+        videoCacheManager.clearCache()
+        if (currentScreen == Screen.VIDEO_BROWSER) {
+            rvVideos.requestFocus()
         }
+    }
+
+    private fun launchExternalVideoPlayer(file: File, item: PtpMediaItem) {
+        try {
+            val authority = "${applicationContext.packageName}.fileprovider"
+            val contentUri = FileProvider.getUriForFile(this, authority, file)
+            val mimeType = PtpConstants.getMimeType(item.filename, item.format)
+
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(contentUri, mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(intent, getString(R.string.open_with_tv_player)).apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(chooser)
+        } catch (e: Exception) {
+            Log.e(PtpConstants.TAG, "Failed to launch external player", e)
+            Toast.makeText(this, "Could not open external player: ${e.message}", Toast.LENGTH_LONG).show()
+            rvVideos.requestFocus()
+        }
+    }
+
+    private fun playVideoLocally(file: File) {
+        showScreen(Screen.VIDEO_PLAYER)
+        videoView.visibility = View.GONE
+        tvVideoError.visibility = View.GONE
+        layoutVideoBuffering.visibility = View.VISIBLE
+
+        videoView.visibility = View.VISIBLE
+        videoView.setVideoPath(file.absolutePath)
+        videoView.setOnPreparedListener { mp ->
+            layoutVideoBuffering.visibility = View.GONE
+            mp.isLooping = false
+            videoView.start()
+        }
+        videoView.setOnErrorListener { _, what, extra ->
+            Log.e(PtpConstants.TAG, "VideoView playback error: what=$what extra=$extra")
+            layoutVideoBuffering.visibility = View.GONE
+            tvVideoError.visibility = View.VISIBLE
+            true
+        }
+        videoView.setOnCompletionListener {
+            // Playback finished
+        }
+    }
+
+    private fun stopAndClearVideoPlayer() {
+        try {
+            if (videoView.isPlaying) {
+                videoView.stopPlayback()
+            }
+        } catch (_: Exception) {}
         videoCacheManager.clearCache()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        initJob?.cancel()
+        videoScanJob?.cancel()
+        photoLoadJob?.cancel()
+        videoCachingJob?.cancel()
+        stopAndClearVideoPlayer()
+        thumbnailLoader.clear()
+        videoCacheManager.clearAll()
+        usbHostManager.stop()
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // Handle dialogs first
+        if (layoutVideoPrepDialog.visibility == View.VISIBLE) {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                cancelVideoPreparation()
+                return true
+            }
+        }
+
+        if (layoutVideoOptionsDialog.visibility == View.VISIBLE) {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                layoutVideoOptionsDialog.visibility = View.GONE
+                rvVideos.requestFocus()
+                return true
+            }
+        }
+
         when (currentScreen) {
             Screen.PHOTO_VIEWER -> {
                 when (keyCode) {
+                    KeyEvent.KEYCODE_BACK -> {
+                        photoLoadJob?.cancel()
+                        showScreen(Screen.PHOTO_BROWSER)
+                        rvPhotos.requestFocus()
+                        return true
+                    }
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
                         if (currentPhotoIndex > 0) {
                             currentPhotoIndex--
@@ -384,17 +592,16 @@ class MainActivity : AppCompatActivity() {
                         }
                         return true
                     }
-                    KeyEvent.KEYCODE_BACK -> {
-                        photoLoadJob?.cancel()
-                        ivFullPhoto.setImageBitmap(null)
-                        showScreen(Screen.PHOTO_BROWSER)
-                        rvPhotos.requestFocus()
-                        return true
-                    }
                 }
             }
             Screen.VIDEO_PLAYER -> {
                 when (keyCode) {
+                    KeyEvent.KEYCODE_BACK -> {
+                        stopAndClearVideoPlayer()
+                        showScreen(Screen.VIDEO_BROWSER)
+                        rvVideos.requestFocus()
+                        return true
+                    }
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                         if (videoView.isPlaying) {
                             videoView.pause()
@@ -404,19 +611,13 @@ class MainActivity : AppCompatActivity() {
                         return true
                     }
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
-                        val pos = (videoView.currentPosition - 10000).coerceAtLeast(0)
-                        videoView.seekTo(pos)
+                        val newPos = (videoView.currentPosition - 10000).coerceAtLeast(0)
+                        videoView.seekTo(newPos)
                         return true
                     }
                     KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                        val pos = (videoView.currentPosition + 10000).coerceAtMost(videoView.duration)
-                        videoView.seekTo(pos)
-                        return true
-                    }
-                    KeyEvent.KEYCODE_BACK -> {
-                        stopAndClearVideoPlayer()
-                        showScreen(Screen.VIDEO_BROWSER)
-                        rvVideos.requestFocus()
+                        val newPos = (videoView.currentPosition + 10000).coerceAtMost(videoView.duration)
+                        videoView.seekTo(newPos)
                         return true
                     }
                 }

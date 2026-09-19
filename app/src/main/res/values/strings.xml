@@ -21,4 +21,13 @@
     <string name="permission_denied">USB permission denied.</string>
     <string name="ptp_mode_required">PTP mode required</string>
     <string name="session_failed">Could not start PTP session.</string>
+    <string name="scanning_videos">Scanning videos...</string>
+    <string name="videos_discovered">%1$d videos</string>
+    <string name="play_video_title">PLAY VIDEO</string>
+    <string name="play_in_directusb">[ Play in DirectUSB ]</string>
+    <string name="open_with_tv_player">[ Open with TV Video Player ]</string>
+    <string name="cancel">[ CANCEL ]</string>
+    <string name="preparing_video">Preparing video...</string>
+    <string name="retry">[ RETRY ]</string>
+    <string name="transfer_failed">Video transfer failed.</string>
 </resources>

@@ -7,10 +7,11 @@ import android.util.Log
 import com.example.usb.PtpClient
 import com.example.usb.PtpConstants
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.coroutines.coroutineContext
 
 class PtpMediaRepository(private val context: Context) {
 
@@ -19,6 +20,9 @@ class PtpMediaRepository(private val context: Context) {
 
     val photoItems = mutableListOf<PtpMediaItem>()
     val videoItems = mutableListOf<PtpMediaItem>()
+
+    var isVideoScanInProgress: Boolean = false
+        private set
 
     val isSessionReady: Boolean
         get() = activeClient?.isSessionOpen == true
@@ -56,11 +60,11 @@ class PtpMediaRepository(private val context: Context) {
             val storageIds = ptpClient.getStorageIds()
             val primaryStorageId = if (storageIds.isNotEmpty()) storageIds[0] else PtpConstants.STORAGE_ALL
 
-            // 3. Minimal media-handle discovery
-            Log.i(PtpConstants.TAG, "Step 4: Minimal media-handle discovery...")
-            discoverMediaHandles(ptpClient, primaryStorageId)
+            // 3. Fast initial discovery for instantaneous UI response
+            Log.i(PtpConstants.TAG, "Step 4: Fast initial media discovery...")
+            discoverInitialMedia(ptpClient, primaryStorageId)
 
-            Log.i(PtpConstants.TAG, "PTP Ready: ${photoItems.size} photos, ${videoItems.size} videos")
+            Log.i(PtpConstants.TAG, "PTP Initial Ready: ${photoItems.size} photos, ${videoItems.size} videos")
             true
         } catch (e: Exception) {
             Log.e(PtpConstants.TAG, "PTP initialization failed with exception", e)
@@ -68,56 +72,280 @@ class PtpMediaRepository(private val context: Context) {
         }
     }
 
-    private suspend fun discoverMediaHandles(ptpClient: PtpClient, storageId: Int) {
+    private suspend fun discoverInitialMedia(ptpClient: PtpClient, storageId: Int) {
         val foundPhotos = mutableSetOf<Int>()
         val foundVideos = mutableSetOf<Int>()
 
-        // 1. Try format filtering for JPEG (most common photo format)
-        val jpegHandles = ptpClient.getObjectHandles(
-            storageId = storageId,
-            formatCode = PtpConstants.FORMAT_EXIF_JPEG,
-            parentHandle = PtpConstants.PARENT_ALL
-        )
-        if (jpegHandles.isNotEmpty()) {
+        // 1. Quick JPEG format query
+        try {
+            val jpegHandles = ptpClient.getObjectHandles(
+                storageId = storageId,
+                formatCode = PtpConstants.FORMAT_EXIF_JPEG,
+                parentHandle = PtpConstants.PARENT_ALL
+            )
             for (h in jpegHandles) foundPhotos.add(h)
+        } catch (e: Exception) {
+            Log.w(PtpConstants.TAG, "Quick JPEG discovery error", e)
         }
 
-        // 2. Try format filtering for MP4 (most common video format)
-        val mp4Handles = ptpClient.getObjectHandles(
-            storageId = storageId,
-            formatCode = PtpConstants.FORMAT_MP4,
-            parentHandle = PtpConstants.PARENT_ALL
-        )
-        if (mp4Handles.isNotEmpty()) {
+        // 2. Quick MP4 format query
+        try {
+            val mp4Handles = ptpClient.getObjectHandles(
+                storageId = storageId,
+                formatCode = PtpConstants.FORMAT_MP4,
+                parentHandle = PtpConstants.PARENT_ALL
+            )
             for (h in mp4Handles) foundVideos.add(h)
+        } catch (e: Exception) {
+            Log.w(PtpConstants.TAG, "Quick MP4 discovery error", e)
         }
 
-        // If format filtering returned items, we are done with only 2 quick queries!
-        if (foundPhotos.isNotEmpty() || foundVideos.isNotEmpty()) {
-            for (h in foundPhotos) {
-                photoItems.add(PtpMediaItem(handle = h, isVideo = false))
-            }
-            for (h in foundVideos) {
-                videoItems.add(PtpMediaItem(handle = h, isVideo = true))
-            }
-            return
+        for (h in foundPhotos) {
+            photoItems.add(PtpMediaItem(handle = h, isVideo = false))
+        }
+        for (h in foundVideos) {
+            videoItems.add(PtpMediaItem(handle = h, isVideo = true))
         }
 
-        // If format filtering returned nothing (or format-filter unsupported by phone PTP stack),
-        // query all handles on storage
-        Log.i(PtpConstants.TAG, "Format filtering returned no handles, querying all PTP handles")
-        val allHandles = ptpClient.getObjectHandles(
-            storageId = storageId,
-            formatCode = PtpConstants.FORMAT_ALL,
-            parentHandle = PtpConstants.PARENT_ALL
-        )
+        // If both format queries returned nothing, retrieve first batch of handles
+        if (foundPhotos.isEmpty() && foundVideos.isEmpty()) {
+            try {
+                val allHandles = ptpClient.getObjectHandles(
+                    storageId = storageId,
+                    formatCode = PtpConstants.FORMAT_ALL,
+                    parentHandle = PtpConstants.PARENT_ALL
+                )
+                val count = allHandles.size.coerceAtMost(1000)
+                for (i in 0 until count) {
+                    photoItems.add(PtpMediaItem(handle = allHandles[i], isVideo = false))
+                }
+            } catch (e: Exception) {
+                Log.w(PtpConstants.TAG, "Fallback handle retrieval error", e)
+            }
+        }
+    }
 
-        Log.i(PtpConstants.TAG, "Total PTP handles retrieved: ${allHandles.size}")
+    /**
+     * Comprehensive recursive video discovery.
+     * Scans all PTP storages and folders recursively without format or extension exclusions.
+     * Protected against duplicate handles and circular folder references.
+     * Never loads file payloads during scan (only lightweight ObjectInfo).
+     */
+    suspend fun scanAllVideos(
+        onProgress: ((foundCount: Int, isDone: Boolean) -> Unit)? = null
+    ): Int = withContext(Dispatchers.IO) {
+        val client = activeClient ?: return@withContext 0
+        isVideoScanInProgress = true
+        Log.i(PtpConstants.TAG, "Starting comprehensive recursive video discovery...")
 
-        // Protect low-end TV RAM: store up to 2000 handles
-        val count = allHandles.size.coerceAtMost(2000)
-        for (i in 0 until count) {
-            photoItems.add(PtpMediaItem(handle = allHandles[i], isVideo = false))
+        try {
+            val storageIds = try {
+                client.getStorageIds()
+            } catch (e: Exception) {
+                Log.w(PtpConstants.TAG, "Error getting storage IDs for video scan", e)
+                IntArray(0)
+            }
+            val effectiveStorageIds = if (storageIds.isNotEmpty()) storageIds else intArrayOf(PtpConstants.STORAGE_ALL)
+
+            val visitedHandles = HashSet<Int>()
+            val visitedFolders = HashSet<Int>()
+            val folderQueue = ArrayDeque<Pair<Int, Int>>() // Pair(storageId, folderHandle)
+
+            // Seed with known handles
+            for (item in videoItems) {
+                visitedHandles.add(item.handle)
+            }
+            for (item in photoItems) {
+                visitedHandles.add(item.handle)
+            }
+
+            for (sId in effectiveStorageIds) {
+                if (!coroutineContext.isActive) break
+
+                // 1. Try querying PARENT_ALL (-1 / 0xFFFFFFFF)
+                val allHandles = try {
+                    client.getObjectHandles(
+                        storageId = sId,
+                        formatCode = PtpConstants.FORMAT_ALL,
+                        parentHandle = PtpConstants.PARENT_ALL
+                    )
+                } catch (e: Exception) {
+                    Log.w(PtpConstants.TAG, "PARENT_ALL query failed on storage 0x${sId.toString(16)}", e)
+                    IntArray(0)
+                }
+
+                if (allHandles.isNotEmpty()) {
+                    Log.i(PtpConstants.TAG, "Storage 0x${sId.toString(16)} returned ${allHandles.size} handles via PARENT_ALL")
+                    for (h in allHandles) {
+                        if (!coroutineContext.isActive) break
+                        if (!visitedHandles.add(h)) continue
+
+                        val info = try {
+                            client.getObjectInfo(h)
+                        } catch (e: Exception) {
+                            Log.w(PtpConstants.TAG, "Error fetching ObjectInfo for handle $h", e)
+                            null
+                        } ?: continue
+
+                        if (info.isFolder) {
+                            if (visitedFolders.add(h)) {
+                                folderQueue.add(Pair(sId, h))
+                            }
+                        } else if (info.isVideo) {
+                            val item = PtpMediaItem(
+                                handle = h,
+                                isVideo = true,
+                                filename = info.filename,
+                                sizeBytes = info.compressedSize,
+                                format = info.format,
+                                isMetadataLoaded = true
+                            )
+                            withContext(Dispatchers.Main) {
+                                if (videoItems.none { it.handle == h }) {
+                                    videoItems.add(item)
+                                }
+                            }
+                            onProgress?.invoke(videoItems.size, false)
+                        } else if (info.isImage) {
+                            withContext(Dispatchers.Main) {
+                                if (photoItems.none { it.handle == h }) {
+                                    photoItems.add(
+                                        PtpMediaItem(
+                                            handle = h,
+                                            isVideo = false,
+                                            filename = info.filename,
+                                            sizeBytes = info.compressedSize,
+                                            format = info.format,
+                                            isMetadataLoaded = true
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback to PARENT_ROOT (0x00000000)
+                    Log.i(PtpConstants.TAG, "Querying root handles for storage 0x${sId.toString(16)}")
+                    val rootHandles = try {
+                        client.getObjectHandles(
+                            storageId = sId,
+                            formatCode = PtpConstants.FORMAT_ALL,
+                            parentHandle = PtpConstants.PARENT_ROOT
+                        )
+                    } catch (e: Exception) {
+                        Log.w(PtpConstants.TAG, "PARENT_ROOT query failed on storage 0x${sId.toString(16)}", e)
+                        IntArray(0)
+                    }
+                    for (h in rootHandles) {
+                        if (!coroutineContext.isActive) break
+                        if (!visitedHandles.add(h)) continue
+
+                        val info = try {
+                            client.getObjectInfo(h)
+                        } catch (e: Exception) {
+                            null
+                        } ?: continue
+
+                        if (info.isFolder) {
+                            if (visitedFolders.add(h)) {
+                                folderQueue.add(Pair(sId, h))
+                            }
+                        } else if (info.isVideo) {
+                            val item = PtpMediaItem(
+                                handle = h,
+                                isVideo = true,
+                                filename = info.filename,
+                                sizeBytes = info.compressedSize,
+                                format = info.format,
+                                isMetadataLoaded = true
+                            )
+                            withContext(Dispatchers.Main) {
+                                if (videoItems.none { it.handle == h }) {
+                                    videoItems.add(item)
+                                }
+                            }
+                            onProgress?.invoke(videoItems.size, false)
+                        }
+                    }
+                }
+            }
+
+            // Process subfolder queue recursively with depth and loop guards
+            var processedFolderCount = 0
+            val maxFolders = 500
+            while (folderQueue.isNotEmpty() && processedFolderCount < maxFolders && coroutineContext.isActive) {
+                val (sId, folderH) = folderQueue.removeFirst()
+                processedFolderCount++
+
+                val childHandles = try {
+                    client.getObjectHandles(
+                        storageId = sId,
+                        formatCode = PtpConstants.FORMAT_ALL,
+                        parentHandle = folderH
+                    )
+                } catch (e: Exception) {
+                    Log.w(PtpConstants.TAG, "Failed to query child handles for folder $folderH", e)
+                    continue
+                }
+
+                for (ch in childHandles) {
+                    if (!coroutineContext.isActive) break
+                    if (!visitedHandles.add(ch)) continue
+
+                    val info = try {
+                        client.getObjectInfo(ch)
+                    } catch (e: Exception) {
+                        Log.w(PtpConstants.TAG, "Error fetching ObjectInfo for child $ch in folder $folderH", e)
+                        null
+                    } ?: continue
+
+                    if (info.isFolder) {
+                        if (visitedFolders.add(ch)) {
+                            folderQueue.add(Pair(sId, ch))
+                        }
+                    } else if (info.isVideo) {
+                        val item = PtpMediaItem(
+                            handle = ch,
+                            isVideo = true,
+                            filename = info.filename,
+                            sizeBytes = info.compressedSize,
+                            format = info.format,
+                            isMetadataLoaded = true
+                        )
+                        withContext(Dispatchers.Main) {
+                            if (videoItems.none { it.handle == ch }) {
+                                videoItems.add(item)
+                            }
+                        }
+                        onProgress?.invoke(videoItems.size, false)
+                    } else if (info.isImage) {
+                        withContext(Dispatchers.Main) {
+                            if (photoItems.none { it.handle == ch }) {
+                                photoItems.add(
+                                    PtpMediaItem(
+                                        handle = ch,
+                                        isVideo = false,
+                                        filename = info.filename,
+                                        sizeBytes = info.compressedSize,
+                                        format = info.format,
+                                        isMetadataLoaded = true
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Log.i(PtpConstants.TAG, "Video discovery finished: found ${videoItems.size} videos (scanned $processedFolderCount folders).")
+            onProgress?.invoke(videoItems.size, true)
+            videoItems.size
+        } catch (e: Exception) {
+            Log.e(PtpConstants.TAG, "Error during recursive video discovery", e)
+            onProgress?.invoke(videoItems.size, true)
+            videoItems.size
+        } finally {
+            isVideoScanInProgress = false
         }
     }
 
@@ -155,8 +383,7 @@ class PtpMediaRepository(private val context: Context) {
                 inSampleSize = sampleSize
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
-            val bitmap = BitmapFactory.decodeFile(tempFile.absolutePath, decodeOpts)
-            bitmap
+            BitmapFactory.decodeFile(tempFile.absolutePath, decodeOpts)
         } catch (e: OutOfMemoryError) {
             Log.e(PtpConstants.TAG, "OOM loading full photo $handle", e)
             null
@@ -178,6 +405,7 @@ class PtpMediaRepository(private val context: Context) {
             activeClient = null
             photoItems.clear()
             videoItems.clear()
+            isVideoScanInProgress = false
         }
     }
 }

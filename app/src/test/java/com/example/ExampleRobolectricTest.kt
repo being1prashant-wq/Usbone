@@ -104,4 +104,45 @@ class ExampleRobolectricTest {
     val arr32 = PtpPacket.parseUInt32Array(bb)
     assertEquals(0, arr32.size)
   }
+
+  @Test
+  fun `verify PtpConstants isVideoObject recognizes formats and extensions`() {
+    // Standard format codes
+    assertEquals(true, PtpConstants.isVideoObject(PtpConstants.FORMAT_MP4, "video.mp4"))
+    assertEquals(true, PtpConstants.isVideoObject(PtpConstants.FORMAT_MPEG, "video.mpg"))
+    assertEquals(true, PtpConstants.isVideoObject(PtpConstants.FORMAT_3GP, "video.3gp"))
+    assertEquals(true, PtpConstants.isVideoObject(PtpConstants.FORMAT_MKV, "video.mkv"))
+
+    // Unknown or vendor format but with video extensions
+    assertEquals(true, PtpConstants.isVideoObject(PtpConstants.FORMAT_UNDEFINED, "vacation.mkv"))
+    assertEquals(true, PtpConstants.isVideoObject(0xB001, "recording.ts"))
+    assertEquals(true, PtpConstants.isVideoObject(0x0000, "movie.webm"))
+    assertEquals(true, PtpConstants.isVideoObject(0x3000, "clip.mov"))
+    assertEquals(true, PtpConstants.isVideoObject(PtpConstants.FORMAT_UNDEFINED, "video.m2ts"))
+    assertEquals(true, PtpConstants.isVideoObject(PtpConstants.FORMAT_UNDEFINED, "stream.vob"))
+
+    // Non-video files
+    assertEquals(false, PtpConstants.isVideoObject(PtpConstants.FORMAT_EXIF_JPEG, "photo.jpg"))
+    assertEquals(false, PtpConstants.isVideoObject(PtpConstants.FORMAT_PNG, "image.png"))
+    assertEquals(false, PtpConstants.isVideoObject(PtpConstants.FORMAT_UNDEFINED, "document.pdf"))
+  }
+
+  @Test
+  fun `verify PtpConstants getMimeType returns proper types`() {
+    assertEquals("video/mp4", PtpConstants.getMimeType("test.mp4", PtpConstants.FORMAT_MP4))
+    assertEquals("video/x-matroska", PtpConstants.getMimeType("movie.mkv", PtpConstants.FORMAT_UNDEFINED))
+    assertEquals("video/quicktime", PtpConstants.getMimeType("clip.mov", PtpConstants.FORMAT_UNDEFINED))
+    assertEquals("video/mp2t", PtpConstants.getMimeType("stream.ts", PtpConstants.FORMAT_UNDEFINED))
+    assertEquals("video/webm", PtpConstants.getMimeType("clip.webm", PtpConstants.FORMAT_UNDEFINED))
+  }
+
+  @Test
+  fun `verify new strings exist for dialogs and scanning`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    assertEquals("[ Play in DirectUSB ]", context.getString(R.string.play_in_directusb))
+    assertEquals("[ Open with TV Video Player ]", context.getString(R.string.open_with_tv_player))
+    assertEquals("[ CANCEL ]", context.getString(R.string.cancel))
+    assertEquals("Scanning videos...", context.getString(R.string.scanning_videos))
+    assertEquals("Preparing video...", context.getString(R.string.preparing_video))
+  }
 }
