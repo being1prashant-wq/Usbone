@@ -2,27 +2,27 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_marginStart="16dp"
+    android:layout_marginStart="24dp"
     android:layout_marginTop="4dp"
-    android:layout_marginEnd="16dp"
+    android:layout_marginEnd="24dp"
     android:layout_marginBottom="4dp"
     android:background="@drawable/bg_card_tv_list"
     android:clickable="true"
     android:focusable="true"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:padding="8dp">
+    android:padding="10dp">
 
-    <!-- Thumbnail -->
+    <!-- Square Thumbnail on the Left -->
     <FrameLayout
-        android:layout_width="120dp"
-        android:layout_height="72dp">
+        android:layout_width="72dp"
+        android:layout_height="72dp"
+        android:background="@drawable/bg_album_art">
 
         <ImageView
             android:id="@+id/iv_video_thumb"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="#12161F"
             android:contentDescription="@string/video_item"
             android:scaleType="centerCrop"
             android:src="@drawable/ic_video_placeholder" />
@@ -32,19 +32,19 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="bottom|end"
-            android:layout_margin="4dp"
-            android:background="#B3000000"
+            android:layout_margin="3dp"
+            android:background="#CC000000"
             android:paddingStart="4dp"
             android:paddingTop="1dp"
             android:paddingEnd="4dp"
             android:paddingBottom="1dp"
             android:textColor="#E2E8F0"
-            android:textSize="10sp"
+            android:textSize="9sp"
             android:textStyle="bold" />
 
     </FrameLayout>
 
-    <!-- Metadata -->
+    <!-- Metadata on the Right (Uses remaining space) -->
     <LinearLayout
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -65,7 +65,7 @@
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
+            android:layout_marginTop="6dp"
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
@@ -83,10 +83,11 @@
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginEnd="8dp"
+        android:layout_marginEnd="12dp"
         android:text="▶ PLAY"
         android:textColor="@color/tv_accent_glow"
         android:textSize="12sp"
         android:textStyle="bold" />
 
 </LinearLayout>
+

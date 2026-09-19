@@ -878,7 +878,7 @@ class MainActivity : AppCompatActivity() {
     private fun resetAudioHudTimer() {
         hudHandler.removeCallbacks(hideAudioHudRunnable)
         if (currentScreen == Screen.AUDIO_PLAYER) {
-            hudHandler.postDelayed(hideAudioHudRunnable, 6000)
+            hudHandler.postDelayed(hideAudioHudRunnable, 4000)
         }
     }
 
@@ -1506,6 +1506,9 @@ class MainActivity : AppCompatActivity() {
         videoCachingJob?.cancel()
         videoCacheManager.cancelBuffering()
         try {
+            videoView.setOnPreparedListener(null)
+            videoView.setOnErrorListener(null)
+            videoView.setOnCompletionListener(null)
             videoView.stopPlayback()
         } catch (_: Exception) {}
         currentVideoPlayer = null
@@ -1527,6 +1530,7 @@ class MainActivity : AppCompatActivity() {
         stopAudioPlaybackOnly()
         audioCachingJob?.cancel()
         audioProgressJob?.cancel()
+        audioCacheManager.cancelBuffering()
         audioCacheManager.clearCache()
 
         showScreen(Screen.AUDIO_PLAYER)
@@ -1534,7 +1538,7 @@ class MainActivity : AppCompatActivity() {
         tvAudioError.visibility = View.GONE
         tvAudioError.text = ""
         tvAudioPlayerTitle.text = item.displayName
-        tvAudioPlayerStatus.text = "Buffering track..."
+        tvAudioPlayerStatus.text = ""
         tvAudioTimeCurrent.text = "00:00"
         tvAudioTimeTotal.text = "00:00"
         progressAudioSeek.progress = 0
@@ -1671,6 +1675,9 @@ class MainActivity : AppCompatActivity() {
         audioProgressJob?.cancel()
         audioPlayer?.let {
             try {
+                it.setOnPreparedListener(null)
+                it.setOnErrorListener(null)
+                it.setOnCompletionListener(null)
                 if (it.isPlaying) it.stop()
                 it.release()
             } catch (_: Exception) {}
@@ -1744,11 +1751,17 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             Screen.VIDEO_PLAYER -> {
+                if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+                    showVideoHud()
+                    btnVideoPlayPause.requestFocus()
+                    return true
+                }
+
                 // Any DPAD key interaction shows HUD and resets timer
                 if (layoutVideoControls.visibility != View.VISIBLE) {
                     showVideoHud()
                     btnVideoPlayPause.requestFocus()
-                    if (keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
                         keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
                     ) {
                         return true
@@ -1787,11 +1800,17 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             Screen.AUDIO_PLAYER -> {
+                if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+                    showAudioHud()
+                    btnAudioPlayPause.requestFocus()
+                    return true
+                }
+
                 // Any interaction reveals controls and resets timer
                 if (layoutAudioControls.visibility != View.VISIBLE) {
                     showAudioHud()
                     btnAudioPlayPause.requestFocus()
-                    if (keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
                         keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
                     ) {
                         return true
@@ -1871,6 +1890,8 @@ class MainActivity : AppCompatActivity() {
 
 class PhotoViewHolder(view: View) : RecyclerView.ViewHolder(view) {
     val ivThumb: ImageView = view.findViewById(R.id.iv_thumb)
+    val tvName: TextView? = view.findViewById(R.id.tv_photo_name)
+    val tvSize: TextView? = view.findViewById(R.id.tv_photo_size)
 }
 
 class PhotoAdapter(
@@ -1890,6 +1911,8 @@ class PhotoAdapter(
     override fun onBindViewHolder(holder: PhotoViewHolder, position: Int) {
         val item = items[position]
         holder.itemView.tag = item.handle
+        holder.tvName?.text = item.displayName
+        holder.tvSize?.text = item.formattedSize
         holder.itemView.setOnClickListener { onItemClicked(position) }
         holder.itemView.setOnKeyListener { _, keyCode, event ->
             if (event.action == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_MENU) {

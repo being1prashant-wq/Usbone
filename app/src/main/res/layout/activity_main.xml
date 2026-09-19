@@ -876,8 +876,8 @@
             <!-- Primary Focus: Large, Elevated Hero Artwork -->
             <ImageView
                 android:id="@+id/iv_audio_player_art"
-                android:layout_width="260dp"
-                android:layout_height="260dp"
+                android:layout_width="280dp"
+                android:layout_height="280dp"
                 android:background="@drawable/bg_album_art"
                 android:contentDescription="@string/audio_item"
                 android:elevation="12dp"
@@ -885,34 +885,26 @@
                 android:scaleType="fitCenter"
                 android:src="@drawable/ic_audio_placeholder" />
 
-            <!-- Song Title (Clean, Secondary) -->
+            <!-- Song Title (Hidden to keep player minimal & artwork-dominant) -->
             <TextView
                 android:id="@+id/tv_audio_player_title"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                android:ellipsize="end"
-                android:maxWidth="480dp"
-                android:maxLines="1"
-                android:textColor="@color/white"
-                android:textSize="18sp"
-                android:textStyle="bold" />
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:visibility="gone" />
 
-            <!-- Status Indicator -->
+            <!-- Status Indicator (Hidden to prevent duplicate clutter) -->
             <TextView
                 android:id="@+id/tv_audio_player_status"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:textColor="@color/text_secondary"
-                android:textSize="13sp" />
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:visibility="gone" />
 
             <!-- Buffering Indicator -->
             <LinearLayout
                 android:id="@+id/layout_audio_buffering"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
+                android:layout_marginTop="16dp"
                 android:background="@drawable/bg_badge"
                 android:gravity="center"
                 android:orientation="horizontal"
@@ -942,7 +934,7 @@
                 android:id="@+id/tv_audio_error"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
+                android:layout_marginTop="12dp"
                 android:background="@drawable/bg_player_control"
                 android:padding="16dp"
                 android:text="@string/audio_codec_unsupported"
