@@ -7,11 +7,9 @@ import android.util.Log
 import com.example.usb.PtpClient
 import com.example.usb.PtpConstants
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
-import kotlin.coroutines.coroutineContext
 
 class PtpMediaRepository(private val context: Context) {
 
@@ -20,9 +18,6 @@ class PtpMediaRepository(private val context: Context) {
 
     val photoItems = mutableListOf<PtpMediaItem>()
     val videoItems = mutableListOf<PtpMediaItem>()
-
-    var isVideoScanInProgress: Boolean = false
-        private set
 
     val isSessionReady: Boolean
         get() = activeClient?.isSessionOpen == true
@@ -60,11 +55,11 @@ class PtpMediaRepository(private val context: Context) {
             val storageIds = ptpClient.getStorageIds()
             val primaryStorageId = if (storageIds.isNotEmpty()) storageIds[0] else PtpConstants.STORAGE_ALL
 
-            // 3. Fast initial discovery for instantaneous UI response
-            Log.i(PtpConstants.TAG, "Step 4: Fast initial media discovery...")
-            discoverInitialMedia(ptpClient, primaryStorageId)
+            // 3. Media discovery
+            Log.i(PtpConstants.TAG, "Step 4: Media discovery...")
+            discoverMedia(primaryStorageId)
 
-            Log.i(PtpConstants.TAG, "PTP Initial Ready: ${photoItems.size} photos, ${videoItems.size} videos")
+            Log.i(PtpConstants.TAG, "PTP Ready: ${photoItems.size} photos, ${videoItems.size} videos")
             true
         } catch (e: Exception) {
             Log.e(PtpConstants.TAG, "PTP initialization failed with exception", e)
@@ -72,53 +67,37 @@ class PtpMediaRepository(private val context: Context) {
         }
     }
 
-    private suspend fun discoverInitialMedia(ptpClient: PtpClient, storageId: Int) {
+    suspend fun discoverMedia(storageId: Int = PtpConstants.STORAGE_ALL): Int = withContext(Dispatchers.IO) {
+        val ptpClient = activeClient ?: return@withContext 0
+
+        photoItems.clear()
+        videoItems.clear()
+
         val foundPhotos = mutableSetOf<Int>()
         val foundVideos = mutableSetOf<Int>()
 
-        // 1. Quick Image format queries
-        val imageFormats = intArrayOf(
-            PtpConstants.FORMAT_EXIF_JPEG,
-            PtpConstants.FORMAT_JFIF,
-            PtpConstants.FORMAT_PNG,
-            PtpConstants.FORMAT_HEIF
-        )
-        for (fmt in imageFormats) {
-            try {
-                val handles = ptpClient.getObjectHandles(
-                    storageId = storageId,
-                    formatCode = fmt,
-                    parentHandle = PtpConstants.PARENT_ALL
-                )
-                for (h in handles) foundPhotos.add(h)
-            } catch (e: Exception) {
-                Log.w(PtpConstants.TAG, "Quick image discovery error for format 0x${fmt.toString(16)}", e)
-            }
+        // 1. Quick JPEG format query
+        try {
+            val jpegHandles = ptpClient.getObjectHandles(
+                storageId = storageId,
+                formatCode = PtpConstants.FORMAT_EXIF_JPEG,
+                parentHandle = PtpConstants.PARENT_ALL
+            )
+            for (h in jpegHandles) foundPhotos.add(h)
+        } catch (e: Exception) {
+            Log.w(PtpConstants.TAG, "Quick JPEG discovery error", e)
         }
 
-        // 2. Quick Video format queries (MP4, MKV, AVI, MOV, 3GP, WMV, WEBM, etc.)
-        val videoFormats = intArrayOf(
-            PtpConstants.FORMAT_MP4,
-            PtpConstants.FORMAT_MKV,
-            PtpConstants.FORMAT_AVI,
-            PtpConstants.FORMAT_MOV,
-            PtpConstants.FORMAT_3GP,
-            PtpConstants.FORMAT_3G2,
-            PtpConstants.FORMAT_WMV,
-            PtpConstants.FORMAT_MPEG,
-            PtpConstants.FORMAT_WEBM
-        )
-        for (fmt in videoFormats) {
-            try {
-                val handles = ptpClient.getObjectHandles(
-                    storageId = storageId,
-                    formatCode = fmt,
-                    parentHandle = PtpConstants.PARENT_ALL
-                )
-                for (h in handles) foundVideos.add(h)
-            } catch (e: Exception) {
-                Log.w(PtpConstants.TAG, "Quick video discovery error for format 0x${fmt.toString(16)}", e)
-            }
+        // 2. Quick MP4 format query
+        try {
+            val mp4Handles = ptpClient.getObjectHandles(
+                storageId = storageId,
+                formatCode = PtpConstants.FORMAT_MP4,
+                parentHandle = PtpConstants.PARENT_ALL
+            )
+            for (h in mp4Handles) foundVideos.add(h)
+        } catch (e: Exception) {
+            Log.w(PtpConstants.TAG, "Quick MP4 discovery error", e)
         }
 
         for (h in foundPhotos) {
@@ -128,7 +107,7 @@ class PtpMediaRepository(private val context: Context) {
             videoItems.add(PtpMediaItem(handle = h, isVideo = true))
         }
 
-        // 3. Fallback handle retrieval: if either format queries found nothing or to catch unclassified objects
+        // 3. Fallback handle retrieval if both format queries returned nothing
         if (foundPhotos.isEmpty() && foundVideos.isEmpty()) {
             try {
                 val allHandles = ptpClient.getObjectHandles(
@@ -144,70 +123,8 @@ class PtpMediaRepository(private val context: Context) {
                 Log.w(PtpConstants.TAG, "Fallback handle retrieval error", e)
             }
         }
-    }
 
-    /**
-     * Fast, lightweight video discovery.
-     * Restored to simple non-blocking operation: queries known video formats across available storages
-     * without deep recursive scanning or heavy UI blocking.
-     */
-    suspend fun scanAllVideos(
-        onProgress: ((foundCount: Int, isDone: Boolean) -> Unit)? = null
-    ): Int = withContext(Dispatchers.IO) {
-        val client = activeClient ?: return@withContext 0
-        isVideoScanInProgress = true
-        try {
-            val storageIds = try {
-                client.getStorageIds()
-            } catch (e: Exception) {
-                IntArray(0)
-            }
-            val storagesToQuery = if (storageIds.isNotEmpty()) storageIds else intArrayOf(PtpConstants.STORAGE_ALL)
-
-            val videoFormats = intArrayOf(
-                PtpConstants.FORMAT_MP4,
-                PtpConstants.FORMAT_MKV,
-                PtpConstants.FORMAT_AVI,
-                PtpConstants.FORMAT_MOV,
-                PtpConstants.FORMAT_3GP,
-                PtpConstants.FORMAT_3G2,
-                PtpConstants.FORMAT_WMV,
-                PtpConstants.FORMAT_MPEG,
-                PtpConstants.FORMAT_WEBM
-            )
-
-            val existingHandles = videoItems.map { it.handle }.toMutableSet()
-
-            for (sId in storagesToQuery) {
-                for (fmt in videoFormats) {
-                    if (!coroutineContext.isActive) break
-                    try {
-                        val handles = client.getObjectHandles(
-                            storageId = sId,
-                            formatCode = fmt,
-                            parentHandle = PtpConstants.PARENT_ALL
-                        )
-                        for (h in handles) {
-                            if (existingHandles.add(h)) {
-                                withContext(Dispatchers.Main) {
-                                    videoItems.add(PtpMediaItem(handle = h, isVideo = true))
-                                }
-                                onProgress?.invoke(videoItems.size, false)
-                            }
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-
-            onProgress?.invoke(videoItems.size, true)
-            videoItems.size
-        } catch (e: Exception) {
-            Log.e(PtpConstants.TAG, "Error in video scan", e)
-            onProgress?.invoke(videoItems.size, true)
-            videoItems.size
-        } finally {
-            isVideoScanInProgress = false
-        }
+        photoItems.size + videoItems.size
     }
 
     suspend fun fetchMetadataIfNeeded(item: PtpMediaItem): PtpMediaItem = withContext(Dispatchers.IO) {
@@ -235,7 +152,6 @@ class PtpMediaRepository(private val context: Context) {
                 if (!success) return@withContext null
             }
 
-            // Decode dimensions
             val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(tempFile.absolutePath, boundsOpts)
 
@@ -266,7 +182,6 @@ class PtpMediaRepository(private val context: Context) {
             activeClient = null
             photoItems.clear()
             videoItems.clear()
-            isVideoScanInProgress = false
         }
     }
 }

@@ -1,15 +1,15 @@
 package com.example
 
-import android.content.Intent
-import android.graphics.Bitmap
-import android.media.MediaPlayer
+import android.content.Context
 import android.os.Bundle
+import android.os.Environment
 import android.util.Log
 import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -18,15 +18,17 @@ import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.example.ftp.FtpAdapter
+import com.example.ftp.FtpFileItem
+import com.example.ftp.SimpleFtpClient
 import com.example.media.PhotoThumbnailLoader
 import com.example.media.PtpMediaItem
 import com.example.media.PtpMediaRepository
 import com.example.media.VideoCacheManager
-import com.example.usb.PtpClient
 import com.example.usb.PtpConstants
 import com.example.usb.UsbConnectionState
 import com.example.usb.UsbHostManager
@@ -35,6 +37,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 
 enum class Screen {
     START,
@@ -42,7 +45,8 @@ enum class Screen {
     PHOTO_BROWSER,
     PHOTO_VIEWER,
     VIDEO_BROWSER,
-    VIDEO_PLAYER
+    VIDEO_PLAYER,
+    FOLDERS
 }
 
 class MainActivity : AppCompatActivity() {
@@ -51,6 +55,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var repository: PtpMediaRepository
     private lateinit var thumbnailLoader: PhotoThumbnailLoader
     private lateinit var videoCacheManager: VideoCacheManager
+    private val ftpClient = SimpleFtpClient()
 
     // UI Screen containers
     private lateinit var screenStart: View
@@ -59,6 +64,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var screenPhotoViewer: View
     private lateinit var screenVideoBrowser: View
     private lateinit var screenVideoPlayer: View
+    private lateinit var screenFolders: View
 
     // Start Screen Views
     private lateinit var tvStartStatus: TextView
@@ -67,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvHomeDeviceName: TextView
     private lateinit var btnPhotos: Button
     private lateinit var btnVideos: Button
+    private lateinit var btnFolders: Button
 
     // Photo Browser Views
     private lateinit var rvPhotos: RecyclerView
@@ -85,25 +92,54 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rvVideos: RecyclerView
     private lateinit var tvVideosCount: TextView
     private lateinit var tvEmptyVideos: TextView
-    private lateinit var layoutVideoScanning: View
-    private lateinit var tvVideoScanningStatus: TextView
     private lateinit var videoAdapter: VideoAdapter
 
     // Video Player Views
     private lateinit var videoView: VideoView
     private lateinit var layoutVideoBuffering: View
     private lateinit var tvVideoError: TextView
+    private var videoOriginScreen: Screen = Screen.VIDEO_BROWSER
 
-    // Video Selection Dialog Views
-    private lateinit var layoutVideoOptionsDialog: View
-    private lateinit var tvDialogVideoTitle: TextView
-    private lateinit var tvDialogVideoMeta: TextView
-    private lateinit var btnPlayDirectusb: Button
-    private lateinit var btnPlayExternal: Button
-    private lateinit var btnCancelPlay: Button
+    // Folders (FTP) Views
+    private lateinit var tvFoldersPath: TextView
+    private lateinit var btnFoldersDisconnect: Button
+    private lateinit var layoutFtpConnect: LinearLayout
+    private lateinit var etFtpHost: EditText
+    private lateinit var etFtpPort: EditText
+    private lateinit var btnFtpConnect: Button
+    private lateinit var progressFtpConnect: ProgressBar
+    private lateinit var tvFtpStatus: TextView
 
-    // Video Preparation Dialog Views
-    private lateinit var layoutVideoPrepDialog: View
+    private lateinit var layoutFtpBrowser: LinearLayout
+    private lateinit var btnFolderUp: Button
+    private lateinit var rvFolders: RecyclerView
+    private lateinit var progressFolders: ProgressBar
+    private lateinit var tvEmptyFolders: TextView
+    private lateinit var ftpAdapter: FtpAdapter
+    private val ftpItems = mutableListOf<FtpFileItem>()
+    private var ftpCurrentPath: String = "/"
+    private var ftpJob: Job? = null
+
+    // File Actions Dialog (FTP)
+    private lateinit var layoutFileActionsDialog: FrameLayout
+    private lateinit var tvFileActionName: TextView
+    private lateinit var tvFileActionInfo: TextView
+    private lateinit var btnActionPlay: Button
+    private lateinit var btnActionCopy: Button
+    private lateinit var btnActionMove: Button
+    private lateinit var btnActionCancel: Button
+    private var selectedFtpItem: FtpFileItem? = null
+
+    // Destination Choice Dialog (TV Local Storage)
+    private lateinit var layoutDestChoiceDialog: FrameLayout
+    private lateinit var btnDestMovies: Button
+    private lateinit var btnDestDownloads: Button
+    private lateinit var btnDestApp: Button
+    private lateinit var btnDestCancel: Button
+    private var isMoveOperation: Boolean = false
+
+    // Transfer & Video Preparation Dialog
+    private lateinit var layoutVideoPrepDialog: FrameLayout
     private lateinit var tvPrepTitle: TextView
     private lateinit var tvPrepFilename: TextView
     private lateinit var progressVideoPrep: ProgressBar
@@ -113,9 +149,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnPrepCancel: Button
 
     private var selectedVideoItem: PtpMediaItem? = null
-    private var isCurrentPrepExternal: Boolean = false
     private var videoCachingJob: Job? = null
-    private var videoScanJob: Job? = null
+    private var fileTransferJob: Job? = null
     private var initJob: Job? = null
 
     private var currentScreen: Screen = Screen.START
@@ -136,11 +171,13 @@ class MainActivity : AppCompatActivity() {
         screenPhotoViewer = findViewById(R.id.screen_photo_viewer)
         screenVideoBrowser = findViewById(R.id.screen_video_browser)
         screenVideoPlayer = findViewById(R.id.screen_video_player)
+        screenFolders = findViewById(R.id.screen_folders)
 
         tvStartStatus = findViewById(R.id.tv_start_status)
         tvHomeDeviceName = findViewById(R.id.tv_home_device_name)
         btnPhotos = findViewById(R.id.btn_photos)
         btnVideos = findViewById(R.id.btn_videos)
+        btnFolders = findViewById(R.id.btn_folders)
 
         // Home button actions
         btnPhotos.setOnClickListener {
@@ -150,6 +187,9 @@ class MainActivity : AppCompatActivity() {
         btnVideos.setOnClickListener {
             showScreen(Screen.VIDEO_BROWSER)
             rvVideos.requestFocus()
+        }
+        btnFolders.setOnClickListener {
+            openFoldersScreen()
         }
 
         // Photo Browser
@@ -167,8 +207,6 @@ class MainActivity : AppCompatActivity() {
         rvVideos = findViewById(R.id.rv_videos)
         tvVideosCount = findViewById(R.id.tv_videos_count)
         tvEmptyVideos = findViewById(R.id.tv_empty_videos)
-        layoutVideoScanning = findViewById(R.id.layout_video_scanning)
-        tvVideoScanningStatus = findViewById(R.id.tv_video_scanning_status)
         rvVideos.layoutManager = GridLayoutManager(this, 4)
 
         // Video Player
@@ -176,34 +214,100 @@ class MainActivity : AppCompatActivity() {
         layoutVideoBuffering = findViewById(R.id.layout_video_buffering)
         tvVideoError = findViewById(R.id.tv_video_error)
 
-        // Video Selection Dialog
-        layoutVideoOptionsDialog = findViewById(R.id.layout_video_options_dialog)
-        tvDialogVideoTitle = findViewById(R.id.tv_dialog_video_title)
-        tvDialogVideoMeta = findViewById(R.id.tv_dialog_video_meta)
-        btnPlayDirectusb = findViewById(R.id.btn_play_directusb)
-        btnPlayExternal = findViewById(R.id.btn_play_external)
-        btnCancelPlay = findViewById(R.id.btn_cancel_play)
+        // Folders (FTP)
+        tvFoldersPath = findViewById(R.id.tv_folders_path)
+        btnFoldersDisconnect = findViewById(R.id.btn_folders_disconnect)
+        layoutFtpConnect = findViewById(R.id.layout_ftp_connect)
+        etFtpHost = findViewById(R.id.et_ftp_host)
+        etFtpPort = findViewById(R.id.et_ftp_port)
+        btnFtpConnect = findViewById(R.id.btn_ftp_connect)
+        progressFtpConnect = findViewById(R.id.progress_ftp_connect)
+        tvFtpStatus = findViewById(R.id.tv_ftp_status)
 
-        btnPlayDirectusb.setOnClickListener {
-            layoutVideoOptionsDialog.visibility = View.GONE
-            selectedVideoItem?.let { item ->
-                prepareAndPlayVideo(item, isExternal = false)
-            }
+        layoutFtpBrowser = findViewById(R.id.layout_ftp_browser)
+        btnFolderUp = findViewById(R.id.btn_folder_up)
+        rvFolders = findViewById(R.id.rv_folders)
+        progressFolders = findViewById(R.id.progress_folders)
+        tvEmptyFolders = findViewById(R.id.tv_empty_folders)
+        rvFolders.layoutManager = LinearLayoutManager(this)
+
+        // Load saved FTP host/port from preferences
+        val prefs = getSharedPreferences("ftp_prefs", Context.MODE_PRIVATE)
+        etFtpHost.setText(prefs.getString("last_host", ""))
+        etFtpPort.setText(prefs.getString("last_port", "2121"))
+
+        btnFtpConnect.setOnClickListener {
+            connectFtp()
         }
 
-        btnPlayExternal.setOnClickListener {
-            layoutVideoOptionsDialog.visibility = View.GONE
-            selectedVideoItem?.let { item ->
-                prepareAndPlayVideo(item, isExternal = true)
-            }
+        btnFoldersDisconnect.setOnClickListener {
+            disconnectFtp()
         }
 
-        btnCancelPlay.setOnClickListener {
-            layoutVideoOptionsDialog.visibility = View.GONE
-            rvVideos.requestFocus()
+        btnFolderUp.setOnClickListener {
+            navigateFtpUp()
         }
 
-        // Video Preparation Dialog
+        // File Actions Dialog
+        layoutFileActionsDialog = findViewById(R.id.layout_file_actions_dialog)
+        tvFileActionName = findViewById(R.id.tv_file_action_name)
+        tvFileActionInfo = findViewById(R.id.tv_file_action_info)
+        btnActionPlay = findViewById(R.id.btn_action_play)
+        btnActionCopy = findViewById(R.id.btn_action_copy)
+        btnActionMove = findViewById(R.id.btn_action_move)
+        btnActionCancel = findViewById(R.id.btn_action_cancel)
+
+        btnActionPlay.setOnClickListener {
+            layoutFileActionsDialog.visibility = View.GONE
+            selectedFtpItem?.let { playFtpVideo(it) }
+        }
+
+        btnActionCopy.setOnClickListener {
+            layoutFileActionsDialog.visibility = View.GONE
+            showDestinationChoice(isMove = false)
+        }
+
+        btnActionMove.setOnClickListener {
+            layoutFileActionsDialog.visibility = View.GONE
+            showDestinationChoice(isMove = true)
+        }
+
+        btnActionCancel.setOnClickListener {
+            layoutFileActionsDialog.visibility = View.GONE
+            rvFolders.requestFocus()
+        }
+
+        // Destination Choice Dialog
+        layoutDestChoiceDialog = findViewById(R.id.layout_dest_choice_dialog)
+        btnDestMovies = findViewById(R.id.btn_dest_movies)
+        btnDestDownloads = findViewById(R.id.btn_dest_downloads)
+        btnDestApp = findViewById(R.id.btn_dest_app)
+        btnDestCancel = findViewById(R.id.btn_dest_cancel)
+
+        btnDestMovies.setOnClickListener {
+            layoutDestChoiceDialog.visibility = View.GONE
+            val dir = getDestinationDirectory(Environment.DIRECTORY_MOVIES)
+            selectedFtpItem?.let { executeFtpTransfer(it, dir, isMoveOperation) }
+        }
+
+        btnDestDownloads.setOnClickListener {
+            layoutDestChoiceDialog.visibility = View.GONE
+            val dir = getDestinationDirectory(Environment.DIRECTORY_DOWNLOADS)
+            selectedFtpItem?.let { executeFtpTransfer(it, dir, isMoveOperation) }
+        }
+
+        btnDestApp.setOnClickListener {
+            layoutDestChoiceDialog.visibility = View.GONE
+            val dir = getExternalFilesDir(null) ?: filesDir
+            selectedFtpItem?.let { executeFtpTransfer(it, dir, isMoveOperation) }
+        }
+
+        btnDestCancel.setOnClickListener {
+            layoutDestChoiceDialog.visibility = View.GONE
+            rvFolders.requestFocus()
+        }
+
+        // Video / Transfer Preparation Dialog
         layoutVideoPrepDialog = findViewById(R.id.layout_video_prep_dialog)
         tvPrepTitle = findViewById(R.id.tv_prep_title)
         tvPrepFilename = findViewById(R.id.tv_prep_filename)
@@ -217,12 +321,13 @@ class MainActivity : AppCompatActivity() {
             tvPrepError.visibility = View.GONE
             btnPrepRetry.visibility = View.GONE
             selectedVideoItem?.let { item ->
-                prepareAndPlayVideo(item, isExternal = isCurrentPrepExternal)
+                prepareAndPlayVideo(item)
             }
         }
 
         btnPrepCancel.setOnClickListener {
             cancelVideoPreparation()
+            cancelFileTransfer()
         }
     }
 
@@ -257,22 +362,20 @@ class MainActivity : AppCompatActivity() {
                 }
             },
             onItemClicked = { item ->
-                showVideoOptionsDialog(item)
+                prepareAndPlayVideo(item)
             }
         )
         rvVideos.adapter = videoAdapter
+
+        ftpAdapter = FtpAdapter(ftpItems) { item ->
+            onFtpItemClicked(item)
+        }
+        rvFolders.adapter = ftpAdapter
 
         usbHostManager = UsbHostManager(this) { state ->
             handleUsbState(state)
         }
         usbHostManager.start()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        try {
-            videoCacheManager.pruneSharedCache()
-        } catch (_: Exception) {}
     }
 
     private fun handleUsbState(state: UsbConnectionState) {
@@ -305,7 +408,6 @@ class MainActivity : AppCompatActivity() {
                             updateMediaCounts()
                             showScreen(Screen.HOME)
                             btnPhotos.requestFocus()
-                            startVideoDiscovery()
                         } else {
                             usbHostManager.disconnect()
                             tvStartStatus.text = "PTP initialization failed.\nPlease check phone USB mode is set to 'PTP / Transfer photos'."
@@ -326,7 +428,6 @@ class MainActivity : AppCompatActivity() {
             }
             is UsbConnectionState.Disconnected -> {
                 initJob?.cancel()
-                videoScanJob?.cancel()
                 cancelVideoPreparation()
                 stopAndClearVideoPlayer()
                 photoLoadJob?.cancel()
@@ -336,32 +437,10 @@ class MainActivity : AppCompatActivity() {
                         repository.clear()
                     } catch (_: Exception) {}
                 }
-                layoutVideoOptionsDialog.visibility = View.GONE
                 layoutVideoPrepDialog.visibility = View.GONE
-                layoutVideoScanning.visibility = View.GONE
                 tvStartStatus.text = getString(R.string.phone_disconnected)
                 showScreen(Screen.START)
             }
-        }
-    }
-
-    private fun startVideoDiscovery() {
-        videoScanJob?.cancel()
-        videoScanJob = lifecycleScope.launch {
-            layoutVideoScanning.visibility = View.VISIBLE
-            tvVideoScanningStatus.text = getString(R.string.scanning_videos)
-
-            repository.scanAllVideos { foundCount, isDone ->
-                lifecycleScope.launch(Dispatchers.Main) {
-                    updateMediaCounts()
-                    if (isDone) {
-                        layoutVideoScanning.visibility = View.GONE
-                    }
-                }
-            }
-
-            layoutVideoScanning.visibility = View.GONE
-            updateMediaCounts()
         }
     }
 
@@ -386,6 +465,7 @@ class MainActivity : AppCompatActivity() {
         screenPhotoViewer.visibility = if (screen == Screen.PHOTO_VIEWER) View.VISIBLE else View.GONE
         screenVideoBrowser.visibility = if (screen == Screen.VIDEO_BROWSER) View.VISIBLE else View.GONE
         screenVideoPlayer.visibility = if (screen == Screen.VIDEO_PLAYER) View.VISIBLE else View.GONE
+        screenFolders.visibility = if (screen == Screen.FOLDERS) View.VISIBLE else View.GONE
 
         if (screen == Screen.PHOTO_VIEWER) {
             screenPhotoViewer.requestFocus()
@@ -394,6 +474,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ==========================================
+    // PHOTO VIEWER LOGIC
+    // ==========================================
     private fun loadSelectedPhoto(index: Int) {
         if (index < 0 || index >= repository.photoItems.size) return
         val item = repository.photoItems[index]
@@ -415,17 +498,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showVideoOptionsDialog(item: PtpMediaItem) {
-        selectedVideoItem = item
-        tvDialogVideoTitle.text = item.displayName
-        tvDialogVideoMeta.text = if (item.sizeBytes > 0) item.formattedSize else ""
-        layoutVideoOptionsDialog.visibility = View.VISIBLE
-        btnPlayDirectusb.requestFocus()
-    }
-
-    private fun prepareAndPlayVideo(item: PtpMediaItem, isExternal: Boolean) {
+    // ==========================================
+    // VIDEO PLAYBACK LOGIC (PTP)
+    // ==========================================
+    private fun prepareAndPlayVideo(item: PtpMediaItem) {
         val client = repository.client ?: return
-        isCurrentPrepExternal = isExternal
+        selectedVideoItem = item
+        videoOriginScreen = Screen.VIDEO_BROWSER
 
         layoutVideoPrepDialog.visibility = View.VISIBLE
         tvPrepTitle.text = getString(R.string.preparing_video)
@@ -442,7 +521,7 @@ class MainActivity : AppCompatActivity() {
             val cachedFile = videoCacheManager.cacheVideo(
                 client = client,
                 item = item,
-                isForExternalShare = isExternal
+                isForExternalShare = false
             ) { transferred, total ->
                 lifecycleScope.launch(Dispatchers.Main) {
                     if (total > 0) {
@@ -462,11 +541,7 @@ class MainActivity : AppCompatActivity() {
 
             if (cachedFile != null && cachedFile.exists()) {
                 layoutVideoPrepDialog.visibility = View.GONE
-                if (isExternal) {
-                    launchExternalVideoPlayer(cachedFile, item)
-                } else {
-                    playVideoLocally(cachedFile)
-                }
+                playVideoLocally(cachedFile)
             } else {
                 progressVideoPrep.progress = 0
                 tvPrepError.visibility = View.VISIBLE
@@ -483,27 +558,8 @@ class MainActivity : AppCompatActivity() {
         videoCacheManager.clearCache()
         if (currentScreen == Screen.VIDEO_BROWSER) {
             rvVideos.requestFocus()
-        }
-    }
-
-    private fun launchExternalVideoPlayer(file: File, item: PtpMediaItem) {
-        try {
-            val authority = "${applicationContext.packageName}.fileprovider"
-            val contentUri = FileProvider.getUriForFile(this, authority, file)
-            val mimeType = PtpConstants.getMimeType(item.filename, item.format)
-
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(contentUri, mimeType)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            val chooser = Intent.createChooser(intent, getString(R.string.open_with_tv_player)).apply {
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            startActivity(chooser)
-        } catch (e: Exception) {
-            Log.e(PtpConstants.TAG, "Failed to launch external player", e)
-            Toast.makeText(this, "Could not open external player: ${e.message}", Toast.LENGTH_LONG).show()
-            rvVideos.requestFocus()
+        } else if (currentScreen == Screen.FOLDERS) {
+            rvFolders.requestFocus()
         }
     }
 
@@ -527,7 +583,7 @@ class MainActivity : AppCompatActivity() {
             true
         }
         videoView.setOnCompletionListener {
-            // Playback finished
+            // Video finished
         }
     }
 
@@ -540,12 +596,296 @@ class MainActivity : AppCompatActivity() {
         videoCacheManager.clearCache()
     }
 
+    // ==========================================
+    // FOLDERS (FTP) LOGIC
+    // ==========================================
+    private fun openFoldersScreen() {
+        showScreen(Screen.FOLDERS)
+        if (ftpClient.isConnected) {
+            showFtpBrowserView()
+            refreshFtpCurrentDirectory()
+        } else {
+            showFtpConnectView()
+        }
+    }
+
+    private fun showFtpConnectView() {
+        layoutFtpConnect.visibility = View.VISIBLE
+        layoutFtpBrowser.visibility = View.GONE
+        btnFoldersDisconnect.visibility = View.GONE
+        tvFoldersPath.text = ""
+        btnFtpConnect.requestFocus()
+    }
+
+    private fun showFtpBrowserView() {
+        layoutFtpConnect.visibility = View.GONE
+        layoutFtpBrowser.visibility = View.VISIBLE
+        btnFoldersDisconnect.visibility = View.VISIBLE
+        btnFolderUp.requestFocus()
+    }
+
+    private fun connectFtp() {
+        val host = etFtpHost.text.toString().trim()
+        val portStr = etFtpPort.text.toString().trim()
+        val port = portStr.toIntOrNull() ?: 2121
+
+        if (host.isEmpty()) {
+            tvFtpStatus.text = "Please enter phone IP address"
+            return
+        }
+
+        // Save preferences
+        getSharedPreferences("ftp_prefs", Context.MODE_PRIVATE).edit()
+            .putString("last_host", host)
+            .putString("last_port", port.toString())
+            .apply()
+
+        progressFtpConnect.visibility = View.VISIBLE
+        tvFtpStatus.text = "Connecting to $host:$port..."
+        btnFtpConnect.isEnabled = false
+
+        ftpJob?.cancel()
+        ftpJob = lifecycleScope.launch {
+            val success = ftpClient.connect(host = host, port = port)
+            progressFtpConnect.visibility = View.GONE
+            btnFtpConnect.isEnabled = true
+
+            if (success) {
+                tvFtpStatus.text = ""
+                showFtpBrowserView()
+                refreshFtpCurrentDirectory()
+            } else {
+                tvFtpStatus.text = "Connection failed. Please check IP, port, and ensure FTP server is active on phone."
+            }
+        }
+    }
+
+    private fun disconnectFtp() {
+        ftpJob?.cancel()
+        lifecycleScope.launch(Dispatchers.IO) {
+            ftpClient.disconnect()
+        }
+        ftpItems.clear()
+        ftpAdapter.notifyDataSetChanged()
+        showFtpConnectView()
+    }
+
+    private fun refreshFtpCurrentDirectory() {
+        ftpJob?.cancel()
+        ftpJob = lifecycleScope.launch {
+            progressFolders.visibility = View.VISIBLE
+            tvEmptyFolders.visibility = View.GONE
+
+            val pwd = ftpClient.getCurrentDirectory()
+            ftpCurrentPath = pwd
+            tvFoldersPath.text = pwd
+
+            val files = ftpClient.listFiles()
+            ftpItems.clear()
+            ftpItems.addAll(files)
+            ftpAdapter.notifyDataSetChanged()
+
+            progressFolders.visibility = View.GONE
+            tvEmptyFolders.visibility = if (files.isEmpty()) View.VISIBLE else View.GONE
+            if (files.isNotEmpty()) {
+                rvFolders.requestFocus()
+            } else {
+                btnFolderUp.requestFocus()
+            }
+        }
+    }
+
+    private fun navigateFtpUp() {
+        ftpJob?.cancel()
+        ftpJob = lifecycleScope.launch {
+            progressFolders.visibility = View.VISIBLE
+            ftpClient.changeToParentDirectory()
+            refreshFtpCurrentDirectory()
+        }
+    }
+
+    private fun onFtpItemClicked(item: FtpFileItem) {
+        if (item.isDirectory) {
+            ftpJob?.cancel()
+            ftpJob = lifecycleScope.launch {
+                progressFolders.visibility = View.VISIBLE
+                val ok = ftpClient.changeDirectory(item.name)
+                if (ok) {
+                    refreshFtpCurrentDirectory()
+                } else {
+                    progressFolders.visibility = View.GONE
+                    Toast.makeText(this@MainActivity, "Cannot open directory: ${item.name}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } else {
+            // Show File Actions dialog
+            selectedFtpItem = item
+            tvFileActionName.text = item.name
+            tvFileActionInfo.text = item.formattedSize
+            btnActionPlay.visibility = if (item.isVideo) View.VISIBLE else View.GONE
+            layoutFileActionsDialog.visibility = View.VISIBLE
+
+            if (item.isVideo) {
+                btnActionPlay.requestFocus()
+            } else {
+                btnActionCopy.requestFocus()
+            }
+        }
+    }
+
+    private fun playFtpVideo(item: FtpFileItem) {
+        videoOriginScreen = Screen.FOLDERS
+        layoutVideoPrepDialog.visibility = View.VISIBLE
+        tvPrepTitle.text = getString(R.string.preparing_video)
+        tvPrepFilename.text = item.name
+        progressVideoPrep.progress = 0
+        progressVideoPrep.isIndeterminate = (item.sizeBytes <= 0)
+        tvPrepStatus.text = if (item.sizeBytes > 0) "0 MB / ${item.formattedSize}" else "0 MB"
+        tvPrepError.visibility = View.GONE
+        btnPrepRetry.visibility = View.GONE
+        btnPrepCancel.requestFocus()
+
+        val cacheFile = videoCacheManager.localPlaybackFile
+        if (cacheFile.exists()) cacheFile.delete()
+
+        videoCachingJob?.cancel()
+        videoCachingJob = lifecycleScope.launch {
+            val success = withContext(Dispatchers.IO) {
+                try {
+                    FileOutputStream(cacheFile).use { fos ->
+                        ftpClient.downloadFile(item.name, fos, item.sizeBytes) { transferred, total ->
+                            lifecycleScope.launch(Dispatchers.Main) {
+                                if (total > 0) {
+                                    val pct = ((transferred * 100) / total).toInt().coerceIn(0, 100)
+                                    progressVideoPrep.isIndeterminate = false
+                                    progressVideoPrep.progress = pct
+                                    val mbT = transferred / (1024.0 * 1024.0)
+                                    val mbTot = total / (1024.0 * 1024.0)
+                                    tvPrepStatus.text = String.format("%.1f MB / %.1f MB (%d%%)", mbT, mbTot, pct)
+                                } else {
+                                    progressVideoPrep.isIndeterminate = true
+                                    val mbT = transferred / (1024.0 * 1024.0)
+                                    tvPrepStatus.text = String.format("%.1f MB transferred", mbT)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Error downloading FTP video", e)
+                    false
+                }
+            }
+
+            if (success && cacheFile.exists() && cacheFile.length() > 0) {
+                layoutVideoPrepDialog.visibility = View.GONE
+                playVideoLocally(cacheFile)
+            } else {
+                progressVideoPrep.progress = 0
+                tvPrepError.visibility = View.VISIBLE
+                tvPrepError.text = getString(R.string.transfer_failed)
+                btnPrepRetry.visibility = View.GONE
+                btnPrepCancel.requestFocus()
+            }
+        }
+    }
+
+    private fun showDestinationChoice(isMove: Boolean) {
+        isMoveOperation = isMove
+        layoutDestChoiceDialog.visibility = View.VISIBLE
+        btnDestMovies.requestFocus()
+    }
+
+    private fun getDestinationDirectory(type: String): File {
+        return try {
+            val publicDir = Environment.getExternalStoragePublicDirectory(type)
+            if (publicDir.exists() || publicDir.mkdirs()) {
+                publicDir
+            } else {
+                getExternalFilesDir(type) ?: filesDir
+            }
+        } catch (_: Exception) {
+            getExternalFilesDir(type) ?: filesDir
+        }
+    }
+
+    private fun executeFtpTransfer(item: FtpFileItem, destDir: File, isMove: Boolean) {
+        val destFile = File(destDir, item.name)
+
+        layoutVideoPrepDialog.visibility = View.VISIBLE
+        tvPrepTitle.text = if (isMove) getString(R.string.moving_file) else getString(R.string.copying_file)
+        tvPrepFilename.text = item.name
+        progressVideoPrep.progress = 0
+        progressVideoPrep.isIndeterminate = (item.sizeBytes <= 0)
+        tvPrepStatus.text = if (item.sizeBytes > 0) "0 MB / ${item.formattedSize}" else "0 MB"
+        tvPrepError.visibility = View.GONE
+        btnPrepRetry.visibility = View.GONE
+        btnPrepCancel.requestFocus()
+
+        fileTransferJob?.cancel()
+        fileTransferJob = lifecycleScope.launch {
+            val downloadOk = withContext(Dispatchers.IO) {
+                try {
+                    FileOutputStream(destFile).use { fos ->
+                        ftpClient.downloadFile(item.name, fos, item.sizeBytes) { transferred, total ->
+                            lifecycleScope.launch(Dispatchers.Main) {
+                                if (total > 0) {
+                                    val pct = ((transferred * 100) / total).toInt().coerceIn(0, 100)
+                                    progressVideoPrep.isIndeterminate = false
+                                    progressVideoPrep.progress = pct
+                                    val mbT = transferred / (1024.0 * 1024.0)
+                                    val mbTot = total / (1024.0 * 1024.0)
+                                    tvPrepStatus.text = String.format("%.1f MB / %.1f MB (%d%%)", mbT, mbTot, pct)
+                                } else {
+                                    progressVideoPrep.isIndeterminate = true
+                                    val mbT = transferred / (1024.0 * 1024.0)
+                                    tvPrepStatus.text = String.format("%.1f MB transferred", mbT)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "FTP file transfer error", e)
+                    false
+                }
+            }
+
+            if (downloadOk && destFile.exists()) {
+                if (isMove) {
+                    // Delete from FTP server to complete move
+                    withContext(Dispatchers.IO) {
+                        ftpClient.deleteFile(item.name)
+                    }
+                    refreshFtpCurrentDirectory()
+                }
+                layoutVideoPrepDialog.visibility = View.GONE
+                Toast.makeText(this@MainActivity, "${if (isMove) "Moved" else "Copied"} ${item.name} to ${destDir.name}", Toast.LENGTH_LONG).show()
+                rvFolders.requestFocus()
+            } else {
+                progressVideoPrep.progress = 0
+                tvPrepError.visibility = View.VISIBLE
+                tvPrepError.text = getString(R.string.transfer_failed)
+                btnPrepRetry.visibility = View.GONE
+                btnPrepCancel.requestFocus()
+            }
+        }
+    }
+
+    private fun cancelFileTransfer() {
+        fileTransferJob?.cancel()
+        layoutVideoPrepDialog.visibility = View.GONE
+        rvFolders.requestFocus()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         initJob?.cancel()
-        videoScanJob?.cancel()
         photoLoadJob?.cancel()
         videoCachingJob?.cancel()
+        fileTransferJob?.cancel()
+        ftpJob?.cancel()
+        lifecycleScope.launch(Dispatchers.IO) {
+            ftpClient.disconnect()
+        }
         stopAndClearVideoPlayer()
         thumbnailLoader.clear()
         videoCacheManager.clearAll()
@@ -553,18 +893,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        // Handle dialogs first
+        // Handle active dialogs first
         if (layoutVideoPrepDialog.visibility == View.VISIBLE) {
             if (keyCode == KeyEvent.KEYCODE_BACK) {
                 cancelVideoPreparation()
+                cancelFileTransfer()
                 return true
             }
         }
 
-        if (layoutVideoOptionsDialog.visibility == View.VISIBLE) {
+        if (layoutDestChoiceDialog.visibility == View.VISIBLE) {
             if (keyCode == KeyEvent.KEYCODE_BACK) {
-                layoutVideoOptionsDialog.visibility = View.GONE
-                rvVideos.requestFocus()
+                layoutDestChoiceDialog.visibility = View.GONE
+                rvFolders.requestFocus()
+                return true
+            }
+        }
+
+        if (layoutFileActionsDialog.visibility == View.VISIBLE) {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                layoutFileActionsDialog.visibility = View.GONE
+                rvFolders.requestFocus()
                 return true
             }
         }
@@ -598,8 +947,12 @@ class MainActivity : AppCompatActivity() {
                 when (keyCode) {
                     KeyEvent.KEYCODE_BACK -> {
                         stopAndClearVideoPlayer()
-                        showScreen(Screen.VIDEO_BROWSER)
-                        rvVideos.requestFocus()
+                        showScreen(videoOriginScreen)
+                        if (videoOriginScreen == Screen.VIDEO_BROWSER) {
+                            rvVideos.requestFocus()
+                        } else {
+                            rvFolders.requestFocus()
+                        }
                         return true
                     }
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
@@ -633,6 +986,17 @@ class MainActivity : AppCompatActivity() {
                 if (keyCode == KeyEvent.KEYCODE_BACK) {
                     showScreen(Screen.HOME)
                     btnVideos.requestFocus()
+                    return true
+                }
+            }
+            Screen.FOLDERS -> {
+                if (keyCode == KeyEvent.KEYCODE_BACK) {
+                    if (layoutFtpBrowser.visibility == View.VISIBLE && ftpCurrentPath != "/" && ftpCurrentPath.isNotEmpty()) {
+                        navigateFtpUp()
+                        return true
+                    }
+                    showScreen(Screen.HOME)
+                    btnFolders.requestFocus()
                     return true
                 }
             }

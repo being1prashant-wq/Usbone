@@ -13,8 +13,8 @@ import kotlin.coroutines.coroutineContext
 
 class VideoCacheManager(private val context: Context) {
 
-    private val sharedDir = File(context.cacheDir, "shared_videos")
-    private val localPlaybackFile = File(context.cacheDir, "current_video_playback.mp4")
+    val sharedDir = File(context.cacheDir, "shared_videos")
+    val localPlaybackFile = File(context.cacheDir, "current_video_playback.mp4")
 
     init {
         if (!sharedDir.exists()) {
