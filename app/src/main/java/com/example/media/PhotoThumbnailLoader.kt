@@ -29,6 +29,8 @@ class PhotoThumbnailLoader(
         placeholderResId: Int? = null,
         onLoaded: ((Bitmap?) -> Unit)? = null
     ) {
+        targetImageView.tag = handle
+
         // Check cache first
         val cached = memoryCache.get(handle)
         if (cached != null) {

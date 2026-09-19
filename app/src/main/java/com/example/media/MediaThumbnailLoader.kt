@@ -22,8 +22,8 @@ class MediaThumbnailLoader(
     private val scope: CoroutineScope,
     private val ptpClientProvider: () -> PtpClient?
 ) {
-    // Keep max 30 thumbnails in RAM (~5-6 MB total)
-    private val memoryCache = object : LruCache<Int, Bitmap>(30) {
+    // Keep up to 50 thumbnails in RAM (~5-6 MB total in RGB_565)
+    private val memoryCache = object : LruCache<Int, Bitmap>(50) {
         override fun sizeOf(key: Int, bitmap: Bitmap): Int = 1
     }
 
@@ -36,6 +36,7 @@ class MediaThumbnailLoader(
         onLoaded: ((Bitmap?) -> Unit)? = null
     ) {
         val handle = item.handle
+        targetImageView.tag = handle
 
         // Check cache first
         val cached = memoryCache.get(handle)
@@ -87,7 +88,7 @@ class MediaThumbnailLoader(
                 return extractAudioArtwork(client, item)
             }
 
-            // 3. Video thumbnail: for small video or if partial preview is feasible
+            // 3. Video thumbnail: sample lightweight header or cached file without downloading 3-4GB
             if (item.isVideo) {
                 return extractVideoThumbnail(client, item)
             }
@@ -98,8 +99,8 @@ class MediaThumbnailLoader(
     }
 
     private suspend fun extractAudioArtwork(client: PtpClient, item: PtpMediaItem): Bitmap? {
-        // Read first 128KB where ID3 tags & APIC frames usually live
-        val headerBytes = client.getPartialObject(item.handle, 0, 128 * 1024) ?: return null
+        // Read first 256KB where ID3v2 tags & APIC picture frames live
+        val headerBytes = client.getPartialObject(item.handle, 0, 256 * 1024) ?: return null
         val tempThumbFile = File(context.cacheDir, "thumb_audio_${item.handle}.tmp")
         try {
             FileOutputStream(tempThumbFile).use { it.write(headerBytes) }
@@ -112,7 +113,7 @@ class MediaThumbnailLoader(
                         inJustDecodeBounds = true
                     }
                     BitmapFactory.decodeByteArray(rawArt, 0, rawArt.size, opts)
-                    val sampleSize = PtpClient.calculateInSampleSize(opts, 240, 240)
+                    val sampleSize = PtpClient.calculateInSampleSize(opts, 280, 280)
                     val decodeOpts = BitmapFactory.Options().apply {
                         inSampleSize = sampleSize
                         inPreferredConfig = Bitmap.Config.RGB_565
@@ -131,9 +132,10 @@ class MediaThumbnailLoader(
     }
 
     private suspend fun extractVideoThumbnail(client: PtpClient, item: PtpMediaItem): Bitmap? {
-        // If file is very small (< 2MB) or we already have cached video
-        val cached = File(context.cacheDir, "current_video_playback.${item.filename.substringAfterLast('.', "mp4")}")
-        if (cached.exists() && cached.length() > 0) {
+        // 1. Check if video file is already cached locally from playback
+        val ext = item.filename.substringAfterLast('.', "mp4")
+        val cached = File(context.cacheDir, "current_video_playback.$ext")
+        if (cached.exists() && cached.length() > 500 * 1024L) {
             val retriever = MediaMetadataRetriever()
             try {
                 retriever.setDataSource(cached.absolutePath)
@@ -142,6 +144,29 @@ class MediaThumbnailLoader(
             } finally {
                 retriever.release()
             }
+        }
+
+        // 2. For video files where moov/header is at the start (fast-start MP4), sample first 600KB
+        val headerBytes = client.getPartialObject(item.handle, 0, 600 * 1024) ?: return null
+        val tempVideoChunk = File(context.cacheDir, "thumb_vid_${item.handle}.tmp")
+        try {
+            FileOutputStream(tempVideoChunk).use { it.write(headerBytes) }
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(tempVideoChunk.absolutePath)
+                val frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                if (frame != null) {
+                    val scaled = Bitmap.createScaledBitmap(frame, 240, 135, true)
+                    if (scaled != frame) frame.recycle()
+                    return scaled
+                }
+            } finally {
+                retriever.release()
+            }
+        } catch (_: Exception) {
+            // Fallback gracefully
+        } finally {
+            if (tempVideoChunk.exists()) tempVideoChunk.delete()
         }
         return null
     }
