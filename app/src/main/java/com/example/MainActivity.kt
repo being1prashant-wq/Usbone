@@ -1,5 +1,6 @@
 package com.example
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -25,6 +26,7 @@ import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -186,6 +188,16 @@ class MainActivity : AppCompatActivity() {
     private var currentVideoIndex = -1
     private var isVideoTracking = false
     private var currentPlaybackSpeed: Float = 1.0f
+    private var currentVideoSessionId: Long = 0L
+
+    // Storage Permission Handling for TV copy
+    private var storagePermissionCallback: ((Boolean) -> Unit)? = null
+    private val storagePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        storagePermissionCallback?.invoke(isGranted)
+        storagePermissionCallback = null
+    }
 
     // Video HUD Auto-hide Handler
     private val hudHandler = Handler(Looper.getMainLooper())
@@ -231,6 +243,7 @@ class MainActivity : AppCompatActivity() {
     private var audioProgressJob: Job? = null
     private var currentAudioIndex = -1
     private var isAudioTracking = false
+    private var currentAudioSessionId: Long = 0L
 
     // Playback state configurations
     private var videoLoopMode: LoopMode = LoopMode.OFF
@@ -392,13 +405,30 @@ class MainActivity : AppCompatActivity() {
             context = this,
             scope = lifecycleScope,
             ptpClientProvider = { repository.client },
+            onRequestStoragePermission = { callback ->
+                storagePermissionCallback = callback
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                    storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                } else {
+                    callback(true)
+                }
+            },
             onCopyStart = { filename ->
                 tvCopyStatus.text = getString(R.string.copying_file)
                 tvCopyFileName.text = filename
                 overlayCopy.visibility = View.VISIBLE
                 btnCancelCopy.requestFocus()
             },
-            onCopyProgress = { _, _ -> },
+            onCopyProgress = { written, total ->
+                val mb = written / (1024.0 * 1024.0)
+                if (total > 0) {
+                    val totalMb = total / (1024.0 * 1024.0)
+                    val pct = ((written * 100) / total).toInt()
+                    tvCopyStatus.text = String.format("Copying %.1f / %.1f MB (%d%%)...", mb, totalMb, pct)
+                } else {
+                    tvCopyStatus.text = String.format("Copying %.1f MB...", mb)
+                }
+            },
             onCopyComplete = { success, msg ->
                 overlayCopy.visibility = View.GONE
                 if (success) {
@@ -1293,6 +1323,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun startVideoPlayback(item: PtpMediaItem) {
         val client = repository.client ?: return
+        val sessionId = ++currentVideoSessionId
+
+        // Cancel previous jobs and buffering immediately
+        videoCachingJob?.cancel()
+        videoProgressJob?.cancel()
+        videoCacheManager.cancelBuffering()
+        try {
+            videoView.stopPlayback()
+        } catch (_: Exception) {}
+        currentVideoPlayer = null
+
         showScreen(Screen.VIDEO_PLAYER)
 
         // Reset UI state
@@ -1312,17 +1353,15 @@ class MainActivity : AppCompatActivity() {
         layoutVideoBuffering.visibility = View.VISIBLE
         showVideoHud()
 
-        videoCachingJob?.cancel()
-        videoProgressJob?.cancel()
-
         var playbackInitialized = false
 
         val initPlayback = { file: File ->
-            if (!playbackInitialized && file.exists() && file.length() > 0) {
+            if (sessionId == currentVideoSessionId && !playbackInitialized && file.exists() && file.length() > 0) {
                 playbackInitialized = true
                 try {
                     videoView.setVideoPath(file.absolutePath)
                     videoView.setOnPreparedListener { mp ->
+                        if (sessionId != currentVideoSessionId) return@setOnPreparedListener
                         currentVideoPlayer = mp
                         tvVideoError.visibility = View.GONE
                         layoutVideoBuffering.visibility = View.GONE
@@ -1338,11 +1377,12 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, 0L)
-                        startVideoProgressLoop()
+                        startVideoProgressLoop(sessionId)
                         resetVideoHudTimer()
                     }
 
                     videoView.setOnErrorListener { _, what, extra ->
+                        if (sessionId != currentVideoSessionId) return@setOnErrorListener true
                         Log.e(PtpConstants.TAG, "VideoView playback error: what=$what extra=$extra")
                         layoutVideoBuffering.visibility = View.GONE
                         tvVideoError.text = getString(R.string.video_codec_unsupported)
@@ -1354,6 +1394,7 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     videoView.setOnCompletionListener {
+                        if (sessionId != currentVideoSessionId) return@setOnCompletionListener
                         updateMediaSessionState(PlaybackStateCompat.STATE_STOPPED, videoView.duration.toLong())
                         when (videoLoopMode) {
                             LoopMode.OFF -> {
@@ -1374,11 +1415,13 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(PtpConstants.TAG, "Exception initializing VideoView", e)
-                    layoutVideoBuffering.visibility = View.GONE
-                    tvVideoError.text = getString(R.string.video_codec_unsupported)
-                    tvVideoError.visibility = View.VISIBLE
-                    showVideoHud()
+                    if (sessionId == currentVideoSessionId) {
+                        Log.e(PtpConstants.TAG, "Exception initializing VideoView", e)
+                        layoutVideoBuffering.visibility = View.GONE
+                        tvVideoError.text = getString(R.string.video_codec_unsupported)
+                        tvVideoError.visibility = View.VISIBLE
+                        showVideoHud()
+                    }
                 }
             }
         }
@@ -1389,15 +1432,18 @@ class MainActivity : AppCompatActivity() {
                 handle = item.handle,
                 filename = item.filename,
                 totalSizeBytes = item.sizeBytes,
+                sessionId = sessionId,
                 initialThresholdBytes = 6 * 1024 * 1024L,
                 onInitialBufferReady = { file, _, _ ->
                     withContext(Dispatchers.Main) {
-                        initPlayback(file)
+                        if (sessionId == currentVideoSessionId) {
+                            initPlayback(file)
+                        }
                     }
                 },
                 onProgress = { written, total ->
                     lifecycleScope.launch(Dispatchers.Main) {
-                        if (layoutVideoBuffering.visibility == View.VISIBLE) {
+                        if (sessionId == currentVideoSessionId && layoutVideoBuffering.visibility == View.VISIBLE) {
                             val mb = written / (1024.0 * 1024.0)
                             if (total > 0) {
                                 val totalMb = total / (1024.0 * 1024.0)
@@ -1410,12 +1456,14 @@ class MainActivity : AppCompatActivity() {
                 },
                 onComplete = { file ->
                     withContext(Dispatchers.Main) {
-                        initPlayback(file)
+                        if (sessionId == currentVideoSessionId) {
+                            initPlayback(file)
+                        }
                     }
                 },
                 onError = { ex ->
                     withContext(Dispatchers.Main) {
-                        if (!playbackInitialized) {
+                        if (sessionId == currentVideoSessionId && !playbackInitialized) {
                             layoutVideoBuffering.visibility = View.GONE
                             tvVideoError.text = getString(R.string.video_load_failed)
                             tvVideoError.visibility = View.VISIBLE
@@ -1427,10 +1475,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun startVideoProgressLoop() {
+    private fun startVideoProgressLoop(sessionId: Long = currentVideoSessionId) {
         videoProgressJob?.cancel()
         videoProgressJob = lifecycleScope.launch {
-            while (currentScreen == Screen.VIDEO_PLAYER) {
+            while (currentScreen == Screen.VIDEO_PLAYER && sessionId == currentVideoSessionId) {
                 try {
                     if (videoView.isPlaying && !isVideoTracking) {
                         if (tvVideoError.visibility == View.VISIBLE) {
@@ -1452,16 +1500,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopAndClearVideoPlayer() {
+        currentVideoSessionId++
         hudHandler.removeCallbacks(hideVideoHudRunnable)
         videoProgressJob?.cancel()
         videoCachingJob?.cancel()
+        videoCacheManager.cancelBuffering()
         try {
-            if (videoView.isPlaying) {
-                videoView.stopPlayback()
-            }
+            videoView.stopPlayback()
         } catch (_: Exception) {}
         currentVideoPlayer = null
-        videoCacheManager.clearCache()
+        layoutVideoBuffering.visibility = View.GONE
         updateMediaSessionState(PlaybackStateCompat.STATE_NONE, 0L)
     }
 
@@ -1474,6 +1522,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun startAudioPlayback(item: PtpMediaItem) {
         val client = repository.client ?: return
+        val sessionId = ++currentAudioSessionId
+
+        stopAudioPlaybackOnly()
+        audioCachingJob?.cancel()
+        audioProgressJob?.cancel()
+        audioCacheManager.clearCache()
+
         showScreen(Screen.AUDIO_PLAYER)
 
         tvAudioError.visibility = View.GONE
@@ -1494,17 +1549,22 @@ class MainActivity : AppCompatActivity() {
         mediaThumbnailLoader.loadThumbnail(item, ivAudioPlayerArt, R.drawable.ic_audio_placeholder)
         mediaThumbnailLoader.loadThumbnail(item, ivAudioAmbientBg, R.drawable.ic_audio_placeholder)
 
-        stopAudioPlaybackOnly()
-
-        audioCachingJob?.cancel()
         audioCachingJob = lifecycleScope.launch {
-            val file = audioCacheManager.cacheAudio(client, item.handle, item.filename)
+            val file = audioCacheManager.cacheAudio(
+                client = client,
+                handle = item.handle,
+                filename = item.filename,
+                sessionId = sessionId
+            )
+            if (sessionId != currentAudioSessionId) return@launch
+
             if (file != null && file.exists() && file.length() > 0) {
                 try {
                     val mp = MediaPlayer()
                     audioPlayer = mp
                     mp.setDataSource(file.absolutePath)
                     mp.setOnPreparedListener { player ->
+                        if (sessionId != currentAudioSessionId) return@setOnPreparedListener
                         tvAudioError.visibility = View.GONE
                         layoutAudioBuffering.visibility = View.GONE
                         player.isLooping = (audioLoopMode == LoopMode.SINGLE)
@@ -1513,10 +1573,11 @@ class MainActivity : AppCompatActivity() {
                         tvAudioPlayerStatus.text = "[ PLAYING ]"
                         tvAudioTimeTotal.text = formatTime(player.duration)
                         updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, 0L)
-                        startAudioProgressLoop(player)
+                        startAudioProgressLoop(player, sessionId)
                         resetAudioHudTimer()
                     }
                     mp.setOnErrorListener { _, what, extra ->
+                        if (sessionId != currentAudioSessionId) return@setOnErrorListener true
                         Log.e(PtpConstants.TAG, "Audio playback error: what=$what extra=$extra")
                         layoutAudioBuffering.visibility = View.GONE
                         tvAudioError.text = getString(R.string.audio_codec_unsupported)
@@ -1528,6 +1589,7 @@ class MainActivity : AppCompatActivity() {
                         true
                     }
                     mp.setOnCompletionListener {
+                        if (sessionId != currentAudioSessionId) return@setOnCompletionListener
                         tvAudioPlayerStatus.text = "[ FINISHED ]"
                         progressAudioSeek.progress = 1000
                         updateMediaSessionState(PlaybackStateCompat.STATE_STOPPED, mp.duration.toLong())
@@ -1552,27 +1614,31 @@ class MainActivity : AppCompatActivity() {
                     }
                     mp.prepareAsync()
                 } catch (e: Exception) {
-                    Log.e(PtpConstants.TAG, "Error initializing MediaPlayer for audio", e)
-                    layoutAudioBuffering.visibility = View.GONE
-                    tvAudioError.text = getString(R.string.audio_codec_unsupported)
-                    tvAudioError.visibility = View.VISIBLE
-                    tvAudioPlayerStatus.text = "[ ERROR ]"
-                    showAudioHud()
+                    if (sessionId == currentAudioSessionId) {
+                        Log.e(PtpConstants.TAG, "Error initializing MediaPlayer for audio", e)
+                        layoutAudioBuffering.visibility = View.GONE
+                        tvAudioError.text = getString(R.string.audio_codec_unsupported)
+                        tvAudioError.visibility = View.VISIBLE
+                        tvAudioPlayerStatus.text = "[ ERROR ]"
+                        showAudioHud()
+                    }
                 }
             } else {
-                layoutAudioBuffering.visibility = View.GONE
-                tvAudioError.text = getString(R.string.audio_load_failed)
-                tvAudioError.visibility = View.VISIBLE
-                tvAudioPlayerStatus.text = "[ FAILED ]"
-                showAudioHud()
+                if (sessionId == currentAudioSessionId) {
+                    layoutAudioBuffering.visibility = View.GONE
+                    tvAudioError.text = getString(R.string.audio_load_failed)
+                    tvAudioError.visibility = View.VISIBLE
+                    tvAudioPlayerStatus.text = "[ FAILED ]"
+                    showAudioHud()
+                }
             }
         }
     }
 
-    private fun startAudioProgressLoop(player: MediaPlayer) {
+    private fun startAudioProgressLoop(player: MediaPlayer, sessionId: Long = currentAudioSessionId) {
         audioProgressJob?.cancel()
         audioProgressJob = lifecycleScope.launch {
-            while (audioPlayer == player) {
+            while (audioPlayer == player && sessionId == currentAudioSessionId) {
                 try {
                     if (player.isPlaying && !isAudioTracking) {
                         if (tvAudioError.visibility == View.VISIBLE) {
@@ -1614,8 +1680,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopAndClearAudioPlayer() {
+        currentAudioSessionId++
         audioCachingJob?.cancel()
+        audioCacheManager.cancelBuffering()
         stopAudioPlaybackOnly()
+        layoutAudioBuffering.visibility = View.GONE
         audioCacheManager.clearCache()
     }
 

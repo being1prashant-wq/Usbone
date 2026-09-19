@@ -6,6 +6,7 @@ import com.example.usb.PtpClient
 import com.example.usb.PtpConstants
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -15,6 +16,7 @@ import java.io.OutputStream
 class VideoCacheManager(private val context: Context) {
 
     private var currentTempFile: File? = null
+    @Volatile private var currentSessionId: Long = 0L
     @Volatile private var isBuffering = false
     @Volatile private var currentWrittenBytes = 0L
     @Volatile private var currentTotalBytes = 0L
@@ -27,34 +29,42 @@ class VideoCacheManager(private val context: Context) {
     fun isBufferingActive(): Boolean = isBuffering
     fun getBytesBuffered(): Long = currentWrittenBytes
     fun getTotalBytes(): Long = currentTotalBytes
+    fun getCurrentSessionId(): Long = currentSessionId
+
+    fun cancelBuffering() {
+        currentSessionId = -1L
+        isBuffering = false
+        clearCache()
+    }
 
     /**
-     * Start progressive chunked streaming.
+     * Start progressive chunked streaming with strict session token isolation.
      * Once [initialThresholdBytes] is written to disk (e.g. 6MB to 8MB),
-     * [onInitialBufferReady] is invoked so playback can begin immediately without
-     * waiting for the entire 3-4 GB file to download.
-     * The background stream continues writing data to the file while playback proceeds.
+     * [onInitialBufferReady] is invoked so playback can begin immediately.
      */
     suspend fun streamVideoProgressive(
         client: PtpClient,
         handle: Int,
         filename: String = "",
         totalSizeBytes: Long = -1L,
-        initialThresholdBytes: Long = 6 * 1024 * 1024L, // 6 MB for fast initial startup
+        sessionId: Long,
+        initialThresholdBytes: Long = 6 * 1024 * 1024L,
         onInitialBufferReady: suspend (file: File, initialBytes: Long, totalBytes: Long) -> Unit,
         onProgress: ((writtenBytes: Long, totalBytes: Long) -> Unit)? = null,
         onComplete: suspend (file: File) -> Unit,
         onError: suspend (Exception) -> Unit
     ) = withContext(Dispatchers.IO) {
+        currentSessionId = sessionId
         clearCache()
+
         val ext = filename.substringAfterLast('.', "mp4").lowercase().trim().ifBlank { "mp4" }
-        val targetFile = File(context.cacheDir, "current_video_playback.$ext")
+        val targetFile = File(context.cacheDir, "current_video_playback_${sessionId}.$ext")
         currentTempFile = targetFile
         isBuffering = true
         currentWrittenBytes = 0L
         currentTotalBytes = totalSizeBytes
 
-        Log.i(PtpConstants.TAG, "Starting progressive video buffer for handle $handle ($filename)...")
+        Log.i(PtpConstants.TAG, "Starting progressive video buffer for handle $handle (session=$sessionId, file=$filename)...")
 
         val effectiveThreshold = if (totalSizeBytes in 1..initialThresholdBytes) totalSizeBytes else initialThresholdBytes
         var initialReadyNotified = false
@@ -66,6 +76,9 @@ class VideoCacheManager(private val context: Context) {
                     var lastReportTime: Long = 0L
 
                     override fun write(b: Int) {
+                        if (currentSessionId != sessionId) {
+                            return
+                        }
                         fos.write(b)
                         bytesWritten++
                         currentWrittenBytes = bytesWritten
@@ -74,6 +87,9 @@ class VideoCacheManager(private val context: Context) {
                     }
 
                     override fun write(b: ByteArray, off: Int, len: Int) {
+                        if (currentSessionId != sessionId) {
+                            return
+                        }
                         fos.write(b, off, len)
                         bytesWritten += len
                         currentWrittenBytes = bytesWritten
@@ -82,23 +98,27 @@ class VideoCacheManager(private val context: Context) {
                     }
 
                     private fun checkInitialReady() {
-                        if (!initialReadyNotified && bytesWritten >= effectiveThreshold) {
+                        if (!initialReadyNotified && bytesWritten >= effectiveThreshold && currentSessionId == sessionId) {
                             initialReadyNotified = true
                             try {
                                 fos.flush()
                             } catch (_: Exception) {}
-                            Log.i(PtpConstants.TAG, "Initial progressive buffer reached: $bytesWritten bytes. Ready for playback!")
+                            Log.i(PtpConstants.TAG, "Initial progressive buffer reached: $bytesWritten bytes for session $sessionId")
                             CoroutineScope(Dispatchers.Main).launch {
-                                onInitialBufferReady(targetFile, bytesWritten, totalSizeBytes)
+                                if (currentSessionId == sessionId) {
+                                    onInitialBufferReady(targetFile, bytesWritten, totalSizeBytes)
+                                }
                             }
                         }
                     }
 
                     private fun checkReport() {
                         val now = System.currentTimeMillis()
-                        if (now - lastReportTime > 400) {
+                        if (now - lastReportTime > 350) {
                             lastReportTime = now
-                            onProgress?.invoke(bytesWritten, totalSizeBytes)
+                            if (currentSessionId == sessionId) {
+                                onProgress?.invoke(bytesWritten, totalSizeBytes)
+                            }
                         }
                     }
 
@@ -111,11 +131,23 @@ class VideoCacheManager(private val context: Context) {
                     }
                 }
 
-                val success = client.streamObject(handle, progressiveOutputStream)
+                val success = client.streamObject(
+                    handle = handle,
+                    outputStream = progressiveOutputStream,
+                    isCancelled = { currentSessionId != sessionId || !isActive }
+                )
+
+                if (currentSessionId != sessionId) {
+                    Log.i(PtpConstants.TAG, "Session $sessionId superseded, cancelling video cache completion")
+                    isBuffering = false
+                    if (targetFile.exists()) targetFile.delete()
+                    return@withContext
+                }
+
                 isBuffering = false
 
                 if (success && targetFile.exists() && targetFile.length() > 0) {
-                    Log.i(PtpConstants.TAG, "Progressive stream completed: ${targetFile.length()} bytes")
+                    Log.i(PtpConstants.TAG, "Progressive stream completed: ${targetFile.length()} bytes (session=$sessionId)")
                     if (!initialReadyNotified) {
                         initialReadyNotified = true
                         onInitialBufferReady(targetFile, targetFile.length(), totalSizeBytes)
@@ -127,31 +159,35 @@ class VideoCacheManager(private val context: Context) {
             }
         } catch (e: Exception) {
             isBuffering = false
-            Log.e(PtpConstants.TAG, "Error during progressive video streaming", e)
-            onError(e)
+            if (currentSessionId == sessionId) {
+                Log.e(PtpConstants.TAG, "Error during progressive video streaming for session $sessionId", e)
+                onError(e)
+            } else {
+                Log.i(PtpConstants.TAG, "Ignoring video stream error for superseded session $sessionId")
+                if (targetFile.exists()) targetFile.delete()
+            }
         }
     }
 
     /**
-     * Cache video with dual workflow (fallback full-buffer method):
-     * Workflow 1: Fast progressive write (with progress callback)
-     * Workflow 2: Standard fallback write
+     * Cache video with dual workflow (fallback full-buffer method)
      */
     suspend fun cacheVideo(
         client: PtpClient,
         handle: Int,
         filename: String = "",
+        sessionId: Long,
         onProgress: ((writtenBytes: Long, totalBytes: Long) -> Unit)? = null
     ): File? = withContext(Dispatchers.IO) {
+        currentSessionId = sessionId
         clearCache()
         val ext = filename.substringAfterLast('.', "mp4").lowercase().trim().ifBlank { "mp4" }
-        val targetFile = File(context.cacheDir, "current_video_playback.$ext")
+        val targetFile = File(context.cacheDir, "current_video_playback_${sessionId}.$ext")
         currentTempFile = targetFile
 
-        Log.i(PtpConstants.TAG, "Caching video handle $handle ($filename) to ${targetFile.name}...")
+        Log.i(PtpConstants.TAG, "Caching video handle $handle (session=$sessionId, file=$filename)...")
 
         try {
-            // Workflow 1: Progressive stream with progress monitoring
             var streamSuccess = false
             FileOutputStream(targetFile).use { fos ->
                 val progressOutputStream = object : OutputStream() {
@@ -159,12 +195,14 @@ class VideoCacheManager(private val context: Context) {
                     var lastReportTime: Long = 0L
 
                     override fun write(b: Int) {
+                        if (currentSessionId != sessionId) return
                         fos.write(b)
                         bytesWritten++
                         checkReport()
                     }
 
                     override fun write(b: ByteArray, off: Int, len: Int) {
+                        if (currentSessionId != sessionId) return
                         fos.write(b, off, len)
                         bytesWritten += len
                         checkReport()
@@ -182,12 +220,23 @@ class VideoCacheManager(private val context: Context) {
                         val now = System.currentTimeMillis()
                         if (now - lastReportTime > 300) {
                             lastReportTime = now
-                            onProgress?.invoke(bytesWritten, -1L)
+                            if (currentSessionId == sessionId) {
+                                onProgress?.invoke(bytesWritten, -1L)
+                            }
                         }
                     }
                 }
 
-                streamSuccess = client.streamObject(handle, progressOutputStream)
+                streamSuccess = client.streamObject(
+                    handle = handle,
+                    outputStream = progressOutputStream,
+                    isCancelled = { currentSessionId != sessionId || !isActive }
+                )
+            }
+
+            if (currentSessionId != sessionId) {
+                if (targetFile.exists()) targetFile.delete()
+                return@withContext null
             }
 
             if (streamSuccess && targetFile.exists() && targetFile.length() > 0) {
@@ -195,14 +244,15 @@ class VideoCacheManager(private val context: Context) {
                 return@withContext targetFile
             }
 
-            // Workflow 2: Fallback to direct raw stream if workflow 1 encountered any issue
-            Log.w(PtpConstants.TAG, "Retrying caching with safe fallback workflow for handle $handle...")
+            // Fallback
             if (targetFile.exists()) targetFile.delete()
-
             FileOutputStream(targetFile).use { fos ->
-                val fallbackSuccess = client.streamObject(handle, fos)
-                if (fallbackSuccess && targetFile.exists() && targetFile.length() > 0) {
-                    Log.i(PtpConstants.TAG, "Fallback video cache successful: ${targetFile.length()} bytes")
+                val fallbackSuccess = client.streamObject(
+                    handle = handle,
+                    outputStream = fos,
+                    isCancelled = { currentSessionId != sessionId || !isActive }
+                )
+                if (fallbackSuccess && currentSessionId == sessionId && targetFile.exists() && targetFile.length() > 0) {
                     return@withContext targetFile
                 }
             }
@@ -210,7 +260,7 @@ class VideoCacheManager(private val context: Context) {
             clearCache()
             null
         } catch (e: Exception) {
-            Log.e(PtpConstants.TAG, "Error caching video", e)
+            Log.e(PtpConstants.TAG, "Error caching video session $sessionId", e)
             clearCache()
             null
         }
@@ -221,7 +271,6 @@ class VideoCacheManager(private val context: Context) {
             currentTempFile?.let {
                 if (it.exists()) {
                     it.delete()
-                    Log.i(PtpConstants.TAG, "Temporary video cache cleared: ${it.name}")
                 }
             }
             val files = context.cacheDir.listFiles { _, name ->
@@ -229,7 +278,8 @@ class VideoCacheManager(private val context: Context) {
             }
             files?.forEach { it.delete() }
         } catch (e: Exception) {
-            Log.w(PtpConstants.TAG, "Failed to delete temp video file", e)
+            Log.w(PtpConstants.TAG, "Failed to delete temp video files", e)
         }
     }
 }
+

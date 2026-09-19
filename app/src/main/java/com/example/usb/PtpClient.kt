@@ -6,6 +6,7 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -85,9 +86,22 @@ class PtpClient(
     }
 
     /**
+     * Drain any residual bytes in bulkIn from a previously aborted transfer.
+     */
+    fun drainResidualBulkIn() {
+        try {
+            val dummy = ByteArray(16384)
+            while (safeBulkTransfer(bulkIn, dummy, dummy.size, 20) > 0) {
+                // Drain buffered bytes
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
      * Send command to Bulk OUT
      */
     private fun sendCommand(opCode: Int, transactionId: Int, vararg params: Int): Boolean {
+        drainResidualBulkIn()
         return try {
             val cmd = PtpPacket.buildCommand(opCode, transactionId, *params)
             val transferred = safeBulkTransfer(bulkOut, cmd, cmd.size, usbTimeout)
@@ -320,8 +334,13 @@ class PtpClient(
     /**
      * Stream an object directly to an OutputStream (e.g. temporary cache file).
      * Avoids loading large files into RAM. Handles files > 2GB using unsigned length.
+     * Supports immediate cancellation.
      */
-    suspend fun streamObject(handle: Int, outputStream: OutputStream): Boolean = mutex.withLock {
+    suspend fun streamObject(
+        handle: Int,
+        outputStream: OutputStream,
+        isCancelled: (() -> Boolean)? = null
+    ): Boolean = mutex.withLock {
         withContext(Dispatchers.IO) {
             val tid = nextTransactionId()
             try {
@@ -356,6 +375,12 @@ class PtpClient(
                 }
 
                 while (isIndeterminate || written < totalPayload) {
+                    if (!isActive || isCancelled?.invoke() == true) {
+                        Log.i(PtpConstants.TAG, "streamObject aborted/cancelled for handle $handle at $written bytes")
+                        drainResidualBulkIn()
+                        return@withContext false
+                    }
+
                     val r = safeBulkTransfer(bulkIn, buffer, buffer.size, usbTimeout)
                     if (r <= 0) {
                         if (!isIndeterminate) {
@@ -364,6 +389,13 @@ class PtpClient(
                         }
                         break
                     }
+
+                    if (!isActive || isCancelled?.invoke() == true) {
+                        Log.i(PtpConstants.TAG, "streamObject aborted/cancelled for handle $handle at $written bytes")
+                        drainResidualBulkIn()
+                        return@withContext false
+                    }
+
                     val toWrite = if (isIndeterminate) r.toLong() else r.toLong().coerceAtMost(totalPayload - written)
                     outputStream.write(buffer, 0, toWrite.toInt())
                     written += toWrite
@@ -390,6 +422,7 @@ class PtpClient(
                 resp.isOk
             } catch (e: Exception) {
                 Log.e(PtpConstants.TAG, "Exception streaming object $handle", e)
+                drainResidualBulkIn()
                 false
             }
         }
