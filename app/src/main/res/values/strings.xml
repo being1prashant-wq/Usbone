@@ -27,4 +27,26 @@
     <string name="permission_denied">USB permission denied.</string>
     <string name="ptp_mode_required">PTP mode required</string>
     <string name="session_failed">Could not start PTP session.</string>
+    <string name="play_with">Play with</string>
+    <string name="copy_to_tv">Copy file to TV storage</string>
+    <string name="no_apps_found">No external video apps found</string>
+    <string name="copying_file">Copying file to TV storage...</string>
+    <string name="copy_success">File copied to Downloads/DirectUSB</string>
+    <string name="copy_failed">Copy failed</string>
+    <string name="insufficient_storage">Insufficient storage on TV</string>
+    <string name="queue_title">Playback Queue</string>
+    <string name="queue_empty">Queue is empty</string>
+    <string name="btn_subtitles">SUBS</string>
+    <string name="btn_audio_track">AUDIO TRACK</string>
+    <string name="btn_loop">LOOP</string>
+    <string name="btn_bg_play">BG PLAY</string>
+    <string name="btn_queue">QUEUE</string>
+    <string name="loop_off">Loop: Off</string>
+    <string name="loop_single">Loop: Single</string>
+    <string name="loop_all">Loop: All</string>
+    <string name="bg_play_on">Background Play: ON</string>
+    <string name="bg_play_off">Background Play: OFF</string>
+    <string name="subtitles_off">Subtitles: Off</string>
+    <string name="subtitles_track">Subtitle Track</string>
+    <string name="audio_track">Audio Track</string>
 </resources>
