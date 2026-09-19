@@ -46,6 +46,9 @@ data class PtpObjectInfo(
 
     val isVideo: Boolean
         get() = !isFolder && PtpConstants.isVideo(format, filename)
+
+    val isAudio: Boolean
+        get() = !isFolder && PtpConstants.isAudio(format, filename)
 }
 
 class PtpClient(

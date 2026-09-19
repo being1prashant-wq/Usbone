@@ -19,6 +19,7 @@ class PtpMediaRepository(private val context: Context) {
 
     val photoItems = mutableListOf<PtpMediaItem>()
     val videoItems = mutableListOf<PtpMediaItem>()
+    val audioItems = mutableListOf<PtpMediaItem>()
 
     val isSessionReady: Boolean
         get() = activeClient?.isSessionOpen == true
@@ -34,6 +35,7 @@ class PtpMediaRepository(private val context: Context) {
             activeClient = ptpClient
             photoItems.clear()
             videoItems.clear()
+            audioItems.clear()
 
             Log.i(PtpConstants.TAG, "Step 1: OpenSession...")
             if (!ptpClient.openSession()) {
@@ -60,7 +62,7 @@ class PtpMediaRepository(private val context: Context) {
             Log.i(PtpConstants.TAG, "Step 4: Complete media discovery across all storages...")
             discoverAllMedia(ptpClient, storageIds)
 
-            Log.i(PtpConstants.TAG, "PTP Ready: ${photoItems.size} photos, ${videoItems.size} videos")
+            Log.i(PtpConstants.TAG, "PTP Ready: ${photoItems.size} photos, ${videoItems.size} videos, ${audioItems.size} audio tracks")
             true
         } catch (e: Exception) {
             Log.e(PtpConstants.TAG, "PTP initialization failed with exception", e)
@@ -118,6 +120,14 @@ class PtpMediaRepository(private val context: Context) {
                     PtpConstants.FORMAT_WEBM,
                     PtpConstants.FORMAT_HEIF,
                     PtpConstants.FORMAT_WEBP,
+                    PtpConstants.FORMAT_MP3,
+                    PtpConstants.FORMAT_WAV,
+                    PtpConstants.FORMAT_AAC,
+                    PtpConstants.FORMAT_FLAC,
+                    PtpConstants.FORMAT_M4A,
+                    PtpConstants.FORMAT_OGG,
+                    PtpConstants.FORMAT_WMA,
+                    PtpConstants.FORMAT_UNDEFINED_AUDIO,
                     PtpConstants.FORMAT_ASSOCIATION,
                     PtpConstants.FORMAT_UNDEFINED
                 )
@@ -198,12 +208,26 @@ class PtpMediaRepository(private val context: Context) {
                 continue
             }
 
-            // Identify video or photo
-            if (info.isVideo) {
+            // Identify audio, video or photo
+            if (info.isAudio) {
+                audioItems.add(
+                    PtpMediaItem(
+                        handle = handle,
+                        isVideo = false,
+                        isAudio = true,
+                        filename = info.filename,
+                        sizeBytes = info.compressedSize,
+                        format = info.format,
+                        isMetadataLoaded = true
+                    )
+                )
+                Log.d(PtpConstants.TAG, "Discovered AUDIO: '${info.filename}' (handle $handle, size ${info.compressedSize} B, format 0x${info.format.toString(16)})")
+            } else if (info.isVideo) {
                 videoItems.add(
                     PtpMediaItem(
                         handle = handle,
                         isVideo = true,
+                        isAudio = false,
                         filename = info.filename,
                         sizeBytes = info.compressedSize,
                         format = info.format,
@@ -216,6 +240,7 @@ class PtpMediaRepository(private val context: Context) {
                     PtpMediaItem(
                         handle = handle,
                         isVideo = false,
+                        isAudio = false,
                         filename = info.filename,
                         sizeBytes = info.compressedSize,
                         format = info.format,
@@ -228,7 +253,7 @@ class PtpMediaRepository(private val context: Context) {
             }
         }
 
-        Log.i(PtpConstants.TAG, "Media discovery complete: ${photoItems.size} photos, ${videoItems.size} videos across ${visitedFolders.size} folders (${visitedHandles.size} total objects evaluated)")
+        Log.i(PtpConstants.TAG, "Media discovery complete: ${photoItems.size} photos, ${videoItems.size} videos, ${audioItems.size} audio tracks across ${visitedFolders.size} folders (${visitedHandles.size} total objects evaluated)")
     }
 
     suspend fun fetchMetadataIfNeeded(item: PtpMediaItem): PtpMediaItem = withContext(Dispatchers.IO) {
@@ -288,6 +313,7 @@ class PtpMediaRepository(private val context: Context) {
             activeClient = null
             photoItems.clear()
             videoItems.clear()
+            audioItems.clear()
         }
     }
 }

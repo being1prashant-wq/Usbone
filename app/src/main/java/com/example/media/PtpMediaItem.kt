@@ -2,14 +2,23 @@ package com.example.media
 
 data class PtpMediaItem(
     val handle: Int,
-    val isVideo: Boolean,
+    val isVideo: Boolean = false,
+    val isAudio: Boolean = false,
     var filename: String = "",
     var sizeBytes: Long = 0L,
     var format: Int = 0,
     var isMetadataLoaded: Boolean = false
 ) {
     val displayName: String
-        get() = if (filename.isNotBlank()) filename else if (isVideo) "Video_$handle" else "Photo_$handle"
+        get() = if (filename.isNotBlank()) {
+            filename
+        } else if (isVideo) {
+            "Video_$handle"
+        } else if (isAudio) {
+            "Audio_$handle"
+        } else {
+            "Photo_$handle"
+        }
 
     val formattedSize: String
         get() {
