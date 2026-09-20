@@ -547,7 +547,7 @@ class MainActivity : AppCompatActivity() {
         setVlcPlaybackRate(speed)
     }
 
-    private fun setupAudioControls() {    private fun setupAudioControls() {
+    private fun setupAudioControls() {
         btnAudioPlayPause.setOnClickListener {
             resetAudioHudTimer()
             handlePlayPauseAction()
