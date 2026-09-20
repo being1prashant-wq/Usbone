@@ -814,26 +814,6 @@ class MainActivity : AppCompatActivity() {
         btnCloseQueue.requestFocus()
     }
 
-    private fun showSubtitlesDialog(){
-        val tracks=getVlcTracks("getSpuTracks")
-        if(tracks.isEmpty()){Toast.makeText(this,"No subtitle tracks detected by VLC",Toast.LENGTH_SHORT).show();return}
-        val labels=arrayOf("Subtitles: Off")+tracks.map{it.label}
-        AlertDialog.Builder(this).setTitle(getString(R.string.subtitles_track)).setItems(labels){d,which->
-            if(which==0){setVlcTrack("setSpuTrack",-1);btnVideoSubs.text="💬 SUBS"}
-            else{val t=tracks[which-1];setVlcTrack("setSpuTrack",t.id);btnVideoSubs.text="💬 "+t.label}
-            d.dismiss();btnVideoSubs.requestFocus()
-        }.setNegativeButton("CANCEL",null).show()
-    }
-
-    private fun showAudioTrackDialog(){
-        val tracks=getVlcTracks("getAudioTracks")
-        if(tracks.isEmpty()){Toast.makeText(this,"No audio tracks detected by VLC",Toast.LENGTH_SHORT).show();return}
-        val labels=tracks.map{it.label}.toTypedArray()
-        AlertDialog.Builder(this).setTitle(getString(R.string.audio_track)).setItems(labels){d,which->
-            val t=tracks[which];setVlcTrack("setAudioTrack",t.id);btnVideoAudioTrack.text="🔊 "+t.label;d.dismiss();btnVideoAudioTrack.requestFocus()
-        }.setNegativeButton("CANCEL",null).show()
-    }
-
     private fun handlePlayPauseAction(){
         if(currentScreen==Screen.VIDEO_PLAYER){
             val p=vlcPlayer?:return
