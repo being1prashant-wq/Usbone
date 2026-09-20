@@ -398,7 +398,7 @@
         android:focusable="true"
         android:visibility="gone">
 
-        <VideoView
+        <org.videolan.libvlc.util.VLCVideoLayout
             android:id="@+id/video_view"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
@@ -612,7 +612,7 @@
                     android:background="@drawable/bg_player_control"
                     android:focusable="true"
                     android:minWidth="72dp"
-                    android:text="⏪ 10s"
+                    android:text="⏪ REV"
                     android:textColor="@color/white"
                     android:textSize="13sp" />
 
@@ -637,7 +637,7 @@
                     android:background="@drawable/bg_player_control"
                     android:focusable="true"
                     android:minWidth="72dp"
-                    android:text="10s ⏩"
+                    android:text="⏩ SEEK"
                     android:textColor="@color/white"
                     android:textSize="13sp" />
 

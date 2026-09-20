@@ -25,7 +25,6 @@ import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
-import android.widget.VideoView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -40,7 +39,7 @@ import com.example.media.MediaThumbnailLoader
 import com.example.media.PhotoThumbnailLoader
 import com.example.media.PtpMediaItem
 import com.example.media.PtpMediaRepository
-import com.example.media.VideoCacheManager
+import com.example.media.PtpLoopbackServer
 import com.example.usb.PtpClient
 import com.example.usb.PtpConstants
 import com.example.usb.UsbConnectionState
@@ -50,6 +49,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer as VlcMediaPlayer
+import org.videolan.libvlc.util.VLCVideoLayout
+import android.net.Uri
 import java.io.File
 
 enum class Screen {
@@ -87,7 +91,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var repository: PtpMediaRepository
     private lateinit var legacyPhotoThumbLoader: PhotoThumbnailLoader
     private lateinit var mediaThumbnailLoader: MediaThumbnailLoader
-    private lateinit var videoCacheManager: VideoCacheManager
     private lateinit var audioCacheManager: AudioCacheManager
     private lateinit var contextMenuHelper: MediaContextMenuHelper
 
@@ -155,7 +158,7 @@ class MainActivity : AppCompatActivity() {
     private var displayedVideoList: MutableList<PtpMediaItem> = mutableListOf()
 
     // Video Player Views
-    private lateinit var videoView: VideoView
+    private lateinit var videoLayout: VLCVideoLayout
     private lateinit var layoutVideoBuffering: View
     private lateinit var tvBuffering: TextView
     private lateinit var tvVideoError: TextView
@@ -182,13 +185,22 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnVideoBgPlay: Button
     private lateinit var btnVideoQueue: Button
 
-    private var videoCachingJob: Job? = null
     private var videoProgressJob: Job? = null
-    private var currentVideoPlayer: MediaPlayer? = null
     private var currentVideoIndex = -1
     private var isVideoTracking = false
     private var currentPlaybackSpeed: Float = 1.0f
     private var currentVideoSessionId: Long = 0L
+    private lateinit var bridge: PtpLoopbackServer
+    private var libVlc: LibVLC? = null
+    private var vlcPlayer: VlcMediaPlayer? = null
+    private var currentVlcMedia: Media? = null
+    private var isVlcSeeking: Boolean = false
+    private var vlcViewsAttached: Boolean = false
+    private var isForwardSeekMode: Boolean = false
+    private var forwardSeekSpeed: Float = 1.0f
+    private var isReverseSeekMode: Boolean = false
+    private var reverseSeekJob: Job? = null
+    private var seekRequestId: Long = 0L
 
     // Storage Permission Handling for TV copy
     private var storagePermissionCallback: ((Boolean) -> Unit)? = null
@@ -333,7 +345,7 @@ class MainActivity : AppCompatActivity() {
         setupVideosBrowserControls()
 
         // Video Player UI
-        videoView = findViewById(R.id.video_view)
+        videoLayout = findViewById(R.id.video_view)
         layoutVideoBuffering = findViewById(R.id.layout_video_buffering)
         tvBuffering = findViewById(R.id.tv_buffering)
         tvVideoError = findViewById(R.id.tv_video_error)
@@ -398,8 +410,10 @@ class MainActivity : AppCompatActivity() {
         repository = PtpMediaRepository(this)
         legacyPhotoThumbLoader = PhotoThumbnailLoader(lifecycleScope) { repository.client }
         mediaThumbnailLoader = MediaThumbnailLoader(this, lifecycleScope) { repository.client }
-        videoCacheManager = VideoCacheManager(this)
         audioCacheManager = AudioCacheManager(this)
+        bridge = PtpLoopbackServer(lifecycleScope, repository)
+        bridge.start()
+        initVlc()
 
         contextMenuHelper = MediaContextMenuHelper(
             context = this,
@@ -407,11 +421,7 @@ class MainActivity : AppCompatActivity() {
             ptpClientProvider = { repository.client },
             onRequestStoragePermission = { callback ->
                 storagePermissionCallback = callback
-                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                    storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                } else {
-                    callback(true)
-                }
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE) else callback(true)
             },
             onCopyStart = { filename ->
                 tvCopyStatus.text = getString(R.string.copying_file)
@@ -419,116 +429,49 @@ class MainActivity : AppCompatActivity() {
                 overlayCopy.visibility = View.VISIBLE
                 btnCancelCopy.requestFocus()
             },
-            onCopyProgress = { written, total ->
-                val mb = written / (1024.0 * 1024.0)
-                if (total > 0) {
-                    val totalMb = total / (1024.0 * 1024.0)
-                    val pct = ((written * 100) / total).toInt()
-                    tvCopyStatus.text = String.format("Copying %.1f / %.1f MB (%d%%)...", mb, totalMb, pct)
-                } else {
-                    tvCopyStatus.text = String.format("Copying %.1f MB...", mb)
-                }
+            onCopyProgress = { written,total ->
+                val mb=written/(1024.0*1024.0)
+                tvCopyStatus.text=if(total>0) String.format("Copying %.1f / %.1f MB (%d%%)...",mb,total/(1024.0*1024.0),((written*100)/total).toInt()) else String.format("Copying %.1f MB...",mb)
             },
-            onCopyComplete = { success, msg ->
-                overlayCopy.visibility = View.GONE
-                if (success) {
-                    Toast.makeText(this, "${getString(R.string.copy_success)}\n$msg", Toast.LENGTH_LONG).show()
-                } else {
-                    Toast.makeText(this, "${getString(R.string.copy_failed)}: $msg", Toast.LENGTH_SHORT).show()
-                }
+            onCopyComplete = { success,msg ->
+                overlayCopy.visibility=View.GONE
+                Toast.makeText(this, if(success) "${getString(R.string.copy_success)}\n$msg" else "${getString(R.string.copy_failed)}: $msg", if(success) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
             }
         )
 
-        photoAdapter = PhotoAdapter(
-            items = displayedPhotoList,
-            thumbnailLoader = legacyPhotoThumbLoader,
-            isListView = { photoViewMode == ViewMode.LIST },
-            onItemClicked = { index ->
-                currentPhotoIndex = index
-                showScreen(Screen.PHOTO_VIEWER)
-                loadSelectedPhoto(index)
-            },
-            onItemMenu = { item ->
-                contextMenuHelper.showContextMenu(item)
-            }
-        )
-        rvPhotos.adapter = photoAdapter
+        photoAdapter=PhotoAdapter(displayedPhotoList,legacyPhotoThumbLoader,{photoViewMode==ViewMode.LIST},
+            { index->currentPhotoIndex=index;showScreen(Screen.PHOTO_VIEWER);loadSelectedPhoto(index) },
+            { item->contextMenuHelper.showContextMenu(item) })
+        rvPhotos.adapter=photoAdapter
 
-        videoAdapter = VideoAdapter(
-            items = displayedVideoList,
-            thumbnailLoader = mediaThumbnailLoader,
-            isListView = { videoViewMode == ViewMode.LIST },
-            onItemBound = { item ->
-                lifecycleScope.launch {
-                    val updated = repository.fetchMetadataIfNeeded(item)
-                    if (updated.isMetadataLoaded) {
-                        val idx = displayedVideoList.indexOf(item)
-                        if (idx >= 0) videoAdapter.notifyItemChanged(idx)
-                    }
-                }
-            },
-            onItemClicked = { item ->
-                val idx = displayedVideoList.indexOf(item)
-                if (idx >= 0) {
-                    playVideoAtIndex(idx)
-                }
-            },
-            onItemMenu = { item ->
-                contextMenuHelper.showContextMenu(item)
-            }
-        )
-        rvVideos.adapter = videoAdapter
+        videoAdapter=VideoAdapter(displayedVideoList,mediaThumbnailLoader,{videoViewMode==ViewMode.LIST},
+            { item->lifecycleScope.launch{val updated=repository.fetchMetadataIfNeeded(item);if(updated.isMetadataLoaded){val idx=displayedVideoList.indexOf(item);if(idx>=0)videoAdapter.notifyItemChanged(idx)}}},
+            { item->displayedVideoList.indexOf(item).takeIf{it>=0}?.let{playVideoAtIndex(it)} },
+            { item->contextMenuHelper.showContextMenu(item) })
+        rvVideos.adapter=videoAdapter
 
-        audioAdapter = AudioAdapter(
-            items = displayedAudioList,
-            thumbnailLoader = mediaThumbnailLoader,
-            isListView = { audioViewMode == ViewMode.LIST },
-            onItemBound = { item ->
-                lifecycleScope.launch {
-                    val updated = repository.fetchMetadataIfNeeded(item)
-                    if (updated.isMetadataLoaded) {
-                        val idx = displayedAudioList.indexOf(item)
-                        if (idx >= 0) audioAdapter.notifyItemChanged(idx)
-                    }
-                }
-            },
-            onItemClicked = { item ->
-                val idx = displayedAudioList.indexOf(item)
-                if (idx >= 0) {
-                    playAudioAtIndex(idx)
-                }
-            },
-            onItemMenu = { item ->
-                contextMenuHelper.showContextMenu(item)
-            }
-        )
-        rvAudio.adapter = audioAdapter
+        audioAdapter=AudioAdapter(displayedAudioList,mediaThumbnailLoader,{audioViewMode==ViewMode.LIST},
+            { item->lifecycleScope.launch{val updated=repository.fetchMetadataIfNeeded(item);if(updated.isMetadataLoaded){val idx=displayedAudioList.indexOf(item);if(idx>=0)audioAdapter.notifyItemChanged(idx)}}},
+            { item->displayedAudioList.indexOf(item).takeIf{it>=0}?.let{playAudioAtIndex(it)} },
+            { item->contextMenuHelper.showContextMenu(item) })
+        rvAudio.adapter=audioAdapter
 
-        queueAdapter = QueueAdapter(
-            items = emptyList(),
-            currentIndex = -1,
-            onItemClicked = { index ->
-                overlayQueue.visibility = View.GONE
-                if (currentScreen == Screen.VIDEO_PLAYER) {
-                    playVideoAtIndex(index)
-                } else if (currentScreen == Screen.AUDIO_PLAYER) {
-                    playAudioAtIndex(index)
-                }
-            }
-        )
-        rvQueue.adapter = queueAdapter
-
-        usbHostManager = UsbHostManager(this) { state ->
-            handleUsbState(state)
+        queueAdapter=QueueAdapter(emptyList(),-1){index->
+            overlayQueue.visibility=View.GONE
+            if(currentScreen==Screen.VIDEO_PLAYER)playVideoAtIndex(index) else if(currentScreen==Screen.AUDIO_PLAYER)playAudioAtIndex(index)
         }
+        rvQueue.adapter=queueAdapter
+        usbHostManager=UsbHostManager(this){state->handleUsbState(state)}
     }
 
     private fun setupPhotosBrowserControls() {
         rvPhotos.layoutManager = GridLayoutManager(this, 4)
         btnPhotosViewMode.setOnClickListener {
-            photoViewMode = if (photoViewMode == ViewMode.GRID) ViewMode.LIST else ViewMode.GRID
-            btnPhotosViewMode.text = if (photoViewMode == ViewMode.GRID) "▦ GRID" else "☰ LIST"
-            rvPhotos.layoutManager = if (photoViewMode == ViewMode.GRID) GridLayoutManager(this, 4) else LinearLayoutManager(this)
+            val isNowList = (photoViewMode == ViewMode.GRID)
+            photoViewMode = if (isNowList) ViewMode.LIST else ViewMode.GRID
+            btnPhotosViewMode.text = if (isNowList) "☰ LIST" else "▦ GRID"
+            rvPhotos.recycledViewPool.clear()
+            rvPhotos.layoutManager = if (isNowList) LinearLayoutManager(this) else GridLayoutManager(this, 4)
             photoAdapter.notifyDataSetChanged()
         }
         btnPhotosSort.setOnClickListener {
@@ -543,9 +486,11 @@ class MainActivity : AppCompatActivity() {
     private fun setupVideosBrowserControls() {
         rvVideos.layoutManager = GridLayoutManager(this, 4)
         btnVideosViewMode.setOnClickListener {
-            videoViewMode = if (videoViewMode == ViewMode.GRID) ViewMode.LIST else ViewMode.GRID
-            btnVideosViewMode.text = if (videoViewMode == ViewMode.GRID) "▦ GRID" else "☰ LIST"
-            rvVideos.layoutManager = if (videoViewMode == ViewMode.GRID) GridLayoutManager(this, 4) else LinearLayoutManager(this)
+            val isNowList = (videoViewMode == ViewMode.GRID)
+            videoViewMode = if (isNowList) ViewMode.LIST else ViewMode.GRID
+            btnVideosViewMode.text = if (isNowList) "☰ LIST" else "▦ GRID"
+            rvVideos.recycledViewPool.clear()
+            rvVideos.layoutManager = if (isNowList) LinearLayoutManager(this) else GridLayoutManager(this, 4)
             videoAdapter.notifyDataSetChanged()
         }
         btnVideosSort.setOnClickListener {
@@ -560,9 +505,11 @@ class MainActivity : AppCompatActivity() {
     private fun setupAudioBrowserControls() {
         rvAudio.layoutManager = GridLayoutManager(this, 4)
         btnAudioViewMode.setOnClickListener {
-            audioViewMode = if (audioViewMode == ViewMode.GRID) ViewMode.LIST else ViewMode.GRID
-            btnAudioViewMode.text = if (audioViewMode == ViewMode.GRID) "▦ GRID" else "☰ LIST"
-            rvAudio.layoutManager = if (audioViewMode == ViewMode.GRID) GridLayoutManager(this, 4) else LinearLayoutManager(this)
+            val isNowList = (audioViewMode == ViewMode.GRID)
+            audioViewMode = if (isNowList) ViewMode.LIST else ViewMode.GRID
+            btnAudioViewMode.text = if (isNowList) "☰ LIST" else "▦ GRID"
+            rvAudio.recycledViewPool.clear()
+            rvAudio.layoutManager = if (isNowList) LinearLayoutManager(this) else GridLayoutManager(this, 4)
             audioAdapter.notifyDataSetChanged()
         }
         btnAudioSort.setOnClickListener {
@@ -578,7 +525,6 @@ class MainActivity : AppCompatActivity() {
         val modes = SortMode.values()
         val names = arrayOf("Default", "Name (A-Z)", "Size (Largest First)", "Newest First")
         val currentIdx = modes.indexOf(current).coerceAtLeast(0)
-
         AlertDialog.Builder(this)
             .setTitle("Sort $title")
             .setSingleChoiceItems(names, currentIdx) { dialog, which ->
@@ -593,11 +539,9 @@ class MainActivity : AppCompatActivity() {
         displayedPhotoList.clear()
         displayedPhotoList.addAll(sortItems(repository.photoItems, photoSortMode))
         photoAdapter.notifyDataSetChanged()
-
         displayedVideoList.clear()
         displayedVideoList.addAll(sortItems(repository.videoItems, videoSortMode))
         videoAdapter.notifyDataSetChanged()
-
         displayedAudioList.clear()
         displayedAudioList.addAll(sortItems(repository.audioItems, audioSortMode))
         audioAdapter.notifyDataSetChanged()
@@ -659,88 +603,93 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupVideoControls() {
-        btnVideoPlayPause.setOnClickListener {
-            resetVideoHudTimer()
-            handlePlayPauseAction()
-        }
-        btnVideoRewind10.setOnClickListener {
-            resetVideoHudTimer()
-            handleRewind10Action()
-        }
-        btnVideoForward10.setOnClickListener {
-            resetVideoHudTimer()
-            handleForward10Action()
-        }
-        btnVideoPrev.setOnClickListener {
-            resetVideoHudTimer()
-            handlePreviousAction()
-        }
-        btnVideoNext.setOnClickListener {
-            resetVideoHudTimer()
-            handleNextAction()
-        }
-
-        btnVideoSpeed.setOnClickListener {
-            resetVideoHudTimer()
-            cyclePlaybackSpeed()
-        }
-
-        btnVideoLoop.setOnClickListener {
-            resetVideoHudTimer()
-            videoLoopMode = when (videoLoopMode) {
-                LoopMode.OFF -> LoopMode.SINGLE
-                LoopMode.SINGLE -> LoopMode.ALL
-                LoopMode.ALL -> LoopMode.OFF
-            }
-            updateLoopButtonUi()
-        }
-
-        btnVideoBgPlay.setOnClickListener {
-            resetVideoHudTimer()
-            isBackgroundPlayEnabled = !isBackgroundPlayEnabled
-            updateBgPlayButtonUi()
-        }
-
-        btnVideoQueue.setOnClickListener {
-            resetVideoHudTimer()
-            showQueueOverlay(displayedVideoList, currentVideoIndex)
-        }
-
-        btnVideoSubs.setOnClickListener {
-            resetVideoHudTimer()
-            showSubtitlesDialog()
-        }
-
-        btnVideoAudioTrack.setOnClickListener {
-            resetVideoHudTimer()
-            showAudioTrackDialog()
-        }
-
-        sbVideoSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser && videoView.duration > 0) {
-                    resetVideoHudTimer()
-                    val targetMs = (progress.toLong() * videoView.duration / 1000L).toInt()
-                    tvVideoTimeCurrent.text = formatTime(targetMs)
-                }
-            }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {
-                isVideoTracking = true
-                resetVideoHudTimer()
-            }
-
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                isVideoTracking = false
-                resetVideoHudTimer()
-                seekBar?.let {
-                    if (videoView.duration > 0) {
-                        val targetMs = (it.progress.toLong() * videoView.duration / 1000L).toInt()
-                        videoView.seekTo(targetMs)
+        btnVideoPlayPause.setOnClickListener { resetVideoHudTimer(); handlePlayPauseAction() }
+        btnVideoRewind10.setOnClickListener { resetVideoHudTimer(); toggleReverseSeek() }
+        btnVideoForward10.setOnClickListener { resetVideoHudTimer(); cycleForwardSeekSpeed() }
+        btnVideoPrev.setOnClickListener { resetVideoHudTimer(); handlePreviousAction() }
+        btnVideoNext.setOnClickListener { resetVideoHudTimer(); handleNextAction() }
+        updateSeekModeButtons()
+        btnVideoSpeed.setOnClickListener { resetVideoHudTimer(); cyclePlaybackSpeed() }
+        btnVideoLoop.setOnClickListener { resetVideoHudTimer(); videoLoopMode=when(videoLoopMode){LoopMode.OFF->LoopMode.SINGLE;LoopMode.SINGLE->LoopMode.ALL;LoopMode.ALL->LoopMode.OFF};updateLoopButtonUi() }
+        btnVideoBgPlay.setOnClickListener { resetVideoHudTimer(); isBackgroundPlayEnabled=!isBackgroundPlayEnabled; updateBgPlayButtonUi() }
+        btnVideoQueue.setOnClickListener { resetVideoHudTimer(); showQueueOverlay(displayedVideoList,currentVideoIndex) }
+        btnVideoSubs.setOnClickListener { resetVideoHudTimer(); showSubtitlesDialog() }
+        btnVideoAudioTrack.setOnClickListener { resetVideoHudTimer(); showAudioTrackDialog() }
+        sbVideoSeek.setOnSeekBarChangeListener(object:SeekBar.OnSeekBarChangeListener{
+            override fun onProgressChanged(sb:SeekBar?,progress:Int,fromUser:Boolean){
+                if(fromUser){
+                    val total=vlcPlayer?.length?:0L
+                    if(total>0){
+                        resetVideoHudTimer()
+                        tvVideoTimeCurrent.text=formatTime((progress.toLong()*total/1000L).toInt())
                     }
                 }
             }
+            override fun onStartTrackingTouch(sb:SeekBar?){
+                isVideoTracking=true
+                resetVideoHudTimer()
+            }
+            override fun onStopTrackingTouch(sb:SeekBar?){
+                isVideoTracking=false
+                resetVideoHudTimer()
+                val p=vlcPlayer?:return
+                val total=try{p.length}catch(_:Throwable){0L}
+                if(total<=0L)return
+                val target=(sb?.progress?.toLong()?:0L)*total/1000L
+                requestVideoSeek(p,target.coerceIn(0L,total))
+            }
         })
+    }
+
+    private fun requestVideoSeek(player: VlcMediaPlayer, target: Long) {
+        seekRequestId += 1L
+        val requestId = seekRequestId
+        isVlcSeeking = true
+        layoutVideoBuffering.visibility = View.VISIBLE
+        tvBuffering.text = "Seeking / buffering..."
+        resetVideoHudTimer()
+
+        lifecycleScope.launch {
+            try {
+                delay(60L)
+                if (requestId != seekRequestId || player !== vlcPlayer || currentScreen != Screen.VIDEO_PLAYER) return@launch
+                if (!try { player.isSeekable() } catch (_: Throwable) { false }) {
+                    isVlcSeeking = false
+                    layoutVideoBuffering.visibility = View.GONE
+                    Toast.makeText(this@MainActivity, "This video is not seekable yet", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                player.setTime(target)
+                var elapsed = 0L
+                while (requestId == seekRequestId &&
+                    player === vlcPlayer &&
+                    currentScreen == Screen.VIDEO_PLAYER &&
+                    isVlcSeeking &&
+                    elapsed < 20000L
+                ) {
+                    delay(180L)
+                    elapsed += 180L
+                    val now = try { player.time } catch (_: Throwable) { target }
+                    if (kotlin.math.abs(now - target) <= 1500L) {
+                        isVlcSeeking = false
+                        layoutVideoBuffering.visibility = View.GONE
+                        break
+                    }
+                }
+
+                if (requestId == seekRequestId && player === vlcPlayer && elapsed >= 20000L) {
+                    isVlcSeeking = false
+                    layoutVideoBuffering.visibility = View.GONE
+                }
+            } catch (e: Throwable) {
+                if (requestId == seekRequestId) {
+                    isVlcSeeking = false
+                    layoutVideoBuffering.visibility = View.GONE
+                }
+                Log.w(PtpConstants.TAG,"VLC seek failed",e)
+            }
+        }
     }
 
     private fun cyclePlaybackSpeed() {
@@ -750,23 +699,106 @@ class MainActivity : AppCompatActivity() {
         setPlaybackSpeed(speeds[nextIdx])
     }
 
-    private fun setPlaybackSpeed(speed: Float) {
-        currentPlaybackSpeed = speed
-        val label = "${speed}x"
-        btnVideoSpeed.text = "⚡ $label"
-        tvVideoHudSpeed.text = label
+    private fun setPlaybackSpeed(speed:Float){
+        currentPlaybackSpeed=speed
+        val label=speed.toString()+"x"
+        btnVideoSpeed.text="⚡ "+label
+        tvVideoHudSpeed.text=label
+        setVlcPlaybackRate(speed)
+    }
 
+    private fun updateSeekModeButtons() {
+        btnVideoRewind10.text = if (isReverseSeekMode) "⏪ REV 1X" else "⏪ REV"
+        btnVideoForward10.text = when {
+            !isForwardSeekMode -> "⏩ SEEK"
+            forwardSeekSpeed >= 3.0f -> "⏩ 3X"
+            forwardSeekSpeed >= 2.0f -> "⏩ 2X"
+            else -> "⏩ 1X"
+        }
+    }
+
+    private fun exitVideoSeekMode(resumePlaying: Boolean) {
+        reverseSeekJob?.cancel()
+        reverseSeekJob = null
+        isReverseSeekMode = false
+        isForwardSeekMode = false
+        forwardSeekSpeed = 1.0f
+        setPlaybackSpeed(1.0f)
+        updateSeekModeButtons()
+        val p = vlcPlayer ?: return
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                currentVideoPlayer?.let { mp ->
-                    val params = mp.playbackParams
-                    params.speed = speed
-                    mp.playbackParams = params
+            if (resumePlaying) p.play() else p.pause()
+        } catch (_: Throwable) {}
+    }
+
+    private fun cycleForwardSeekSpeed() {
+        if (currentScreen != Screen.VIDEO_PLAYER) return
+        val p = vlcPlayer ?: return
+
+        if (isReverseSeekMode) exitVideoSeekMode(resumePlaying = true)
+
+        if (!isForwardSeekMode) {
+            isForwardSeekMode = true
+            forwardSeekSpeed = 1.0f
+        } else {
+            forwardSeekSpeed = when {
+                forwardSeekSpeed < 1.5f -> 2.0f
+                forwardSeekSpeed < 2.5f -> 3.0f
+                else -> {
+                    exitVideoSeekMode(resumePlaying = true)
+                    updateSeekModeButtons()
+                    return
                 }
             }
-        } catch (e: Exception) {
-            Log.w(PtpConstants.TAG, "Could not set playback speed: $speed", e)
         }
+
+        setPlaybackSpeed(forwardSeekSpeed)
+        try {
+            p.play()
+            updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, p.time)
+        } catch (_: Throwable) {}
+        updateSeekModeButtons()
+        showVideoHud()
+    }
+
+    private fun toggleReverseSeek() {
+        if (currentScreen != Screen.VIDEO_PLAYER) return
+        val p = vlcPlayer ?: return
+
+        if (isReverseSeekMode) {
+            exitVideoSeekMode(resumePlaying = true)
+            return
+        }
+
+        if (isForwardSeekMode) exitVideoSeekMode(resumePlaying = true)
+
+        isReverseSeekMode = true
+        isForwardSeekMode = false
+        setPlaybackSpeed(1.0f)
+        updateSeekModeButtons()
+        isVlcSeeking = false
+        layoutVideoBuffering.visibility = View.GONE
+
+        try { p.pause() } catch (_: Throwable) {}
+
+        reverseSeekJob?.cancel()
+        reverseSeekJob = lifecycleScope.launch {
+            while (isReverseSeekMode &&
+                currentScreen == Screen.VIDEO_PLAYER &&
+                p === vlcPlayer
+            ) {
+                try {
+                    val now = p.time
+                    val target = (now - 1000L).coerceAtLeast(0L)
+                    p.setTime(target)
+                    if (target <= 0L) break
+                } catch (_: Throwable) {
+                    break
+                }
+                delay(1000L)
+            }
+        }
+        showVideoHud()
     }
 
     private fun setupAudioControls() {
@@ -851,7 +883,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun hideVideoHud() {
-        if (currentScreen == Screen.VIDEO_PLAYER && videoView.isPlaying && !isVideoTracking && overlayQueue.visibility != View.VISIBLE) {
+        if (currentScreen == Screen.VIDEO_PLAYER && vlcPlayer?.isPlaying == true && !isVideoTracking && overlayQueue.visibility != View.VISIBLE) {
             layoutVideoTopBar.visibility = View.GONE
             layoutVideoControls.visibility = View.GONE
         }
@@ -917,174 +949,47 @@ class MainActivity : AppCompatActivity() {
         btnCloseQueue.requestFocus()
     }
 
-    private fun showSubtitlesDialog() {
-        val mp = currentVideoPlayer
-        if (mp == null) {
-            Toast.makeText(this, "Subtitles not available", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        try {
-            val trackInfo = mp.trackInfo
-            val subtitleTracks = mutableListOf<Pair<Int, String>>()
-            subtitleTracks.add(Pair(-1, getString(R.string.subtitles_off)))
-
-            var subCounter = 1
-            for (i in trackInfo.indices) {
-                if (trackInfo[i].trackType == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT ||
-                    trackInfo[i].trackType == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE
-                ) {
-                    val lang = trackInfo[i].language.ifBlank { "Track $subCounter" }
-                    subtitleTracks.add(Pair(i, lang))
-                    subCounter++
+    private fun handlePlayPauseAction(){
+        if(currentScreen==Screen.VIDEO_PLAYER){
+            val p=vlcPlayer?:return
+            try{
+                if (isForwardSeekMode || isReverseSeekMode) {
+                    exitVideoSeekMode(resumePlaying = false)
+                    btnVideoPlayPause.text="▶ PLAY"
+                    showVideoHud()
+                    updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,p.time)
+                    return
                 }
-            }
-
-            if (subtitleTracks.size == 1) {
-                Toast.makeText(this, "No subtitle tracks embedded in this video", Toast.LENGTH_SHORT).show()
-                return
-            }
-
-            val names = subtitleTracks.map { it.second }.toTypedArray()
-            val selectedIdx = subtitleTracks.indexOfFirst { it.first == currentSubtitlesTrack }.coerceAtLeast(0)
-
-            AlertDialog.Builder(this)
-                .setTitle(getString(R.string.subtitles_track))
-                .setSingleChoiceItems(names, selectedIdx) { dialog, which ->
-                    val chosen = subtitleTracks[which].first
-                    currentSubtitlesTrack = chosen
-                    try {
-                        if (chosen == -1) {
-                            for (p in subtitleTracks) {
-                                if (p.first != -1) mp.deselectTrack(p.first)
-                            }
-                            btnVideoSubs.text = "💬 SUBS"
-                        } else {
-                            mp.selectTrack(chosen)
-                            btnVideoSubs.text = "💬 SUBS: ${subtitleTracks[which].second}"
-                        }
-                    } catch (e: Exception) {
-                        Log.w(PtpConstants.TAG, "Subtitle track selection failed", e)
-                    }
-                    dialog.dismiss()
-                    btnVideoSubs.requestFocus()
+                if(p.isPlaying){
+                    p.pause()
+                    btnVideoPlayPause.text="▶ PLAY"
+                    showVideoHud()
+                    updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,p.time)
+                }else{
+                    p.play()
+                    btnVideoPlayPause.text="⏸ PAUSE"
+                    resetVideoHudTimer()
+                    updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,p.time)
                 }
-                .setOnDismissListener { btnVideoSubs.requestFocus() }
-                .setNegativeButton("CANCEL", null)
-                .show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Subtitles not supported for this media", Toast.LENGTH_SHORT).show()
+            }catch(e:Throwable){Log.w(PtpConstants.TAG,"VLC play/pause failed",e)}
+        }else if(currentScreen==Screen.AUDIO_PLAYER){
+            audioPlayer?.let{mp->try{if(mp.isPlaying){mp.pause();btnAudioPlayPause.text="▶";tvAudioPlayerStatus.text="[ PAUSED ]";showAudioHud();updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,mp.currentPosition.toLong())}else{mp.start();btnAudioPlayPause.text="⏸";tvAudioPlayerStatus.text="[ PLAYING ]";resetAudioHudTimer();updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,mp.currentPosition.toLong())}}catch(_:Exception){}}
         }
     }
 
-    private fun showAudioTrackDialog() {
-        val mp = currentVideoPlayer
-        if (mp == null) {
-            Toast.makeText(this, "Audio tracks not available", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        try {
-            val trackInfo = mp.trackInfo
-            val audioTracks = mutableListOf<Pair<Int, String>>()
-            var audioCounter = 1
-            for (i in trackInfo.indices) {
-                if (trackInfo[i].trackType == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO) {
-                    val lang = trackInfo[i].language.ifBlank { "Track $audioCounter" }
-                    audioTracks.add(Pair(i, lang))
-                    audioCounter++
-                }
-            }
-
-            if (audioTracks.size <= 1) {
-                Toast.makeText(this, "Single audio stream available", Toast.LENGTH_SHORT).show()
-                return
-            }
-
-            val names = audioTracks.map { it.second }.toTypedArray()
-            AlertDialog.Builder(this)
-                .setTitle(getString(R.string.audio_track))
-                .setItems(names) { dialog, which ->
-                    try {
-                        mp.selectTrack(audioTracks[which].first)
-                        btnVideoAudioTrack.text = "🔊 ${audioTracks[which].second}"
-                    } catch (e: Exception) {
-                        Log.w(PtpConstants.TAG, "Audio track switch failed", e)
-                    }
-                    dialog.dismiss()
-                    btnVideoAudioTrack.requestFocus()
-                }
-                .setOnDismissListener { btnVideoAudioTrack.requestFocus() }
-                .setNegativeButton("CANCEL", null)
-                .show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Audio tracks query not supported", Toast.LENGTH_SHORT).show()
+    private fun handleRewind10Action(){
+        if(currentScreen==Screen.VIDEO_PLAYER){
+            toggleReverseSeek()
+        }else if(currentScreen==Screen.AUDIO_PLAYER){
+            audioPlayer?.let{mp->try{mp.seekTo((mp.currentPosition-10000).coerceAtLeast(0));showAudioHud()}catch(_:Exception){}}
         }
     }
 
-    private fun handlePlayPauseAction() {
-        if (currentScreen == Screen.VIDEO_PLAYER) {
-            if (videoView.isPlaying) {
-                videoView.pause()
-                btnVideoPlayPause.text = "▶ PLAY"
-                showVideoHud()
-                updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED, videoView.currentPosition.toLong())
-            } else {
-                videoView.start()
-                btnVideoPlayPause.text = "⏸ PAUSE"
-                resetVideoHudTimer()
-                updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, videoView.currentPosition.toLong())
-            }
-        } else if (currentScreen == Screen.AUDIO_PLAYER) {
-            audioPlayer?.let { mp ->
-                try {
-                    if (mp.isPlaying) {
-                        mp.pause()
-                        btnAudioPlayPause.text = "▶"
-                        tvAudioPlayerStatus.text = "[ PAUSED ]"
-                        showAudioHud()
-                        updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED, mp.currentPosition.toLong())
-                    } else {
-                        mp.start()
-                        btnAudioPlayPause.text = "⏸"
-                        tvAudioPlayerStatus.text = "[ PLAYING ]"
-                        resetAudioHudTimer()
-                        updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, mp.currentPosition.toLong())
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-    }
-
-    private fun handleRewind10Action() {
-        if (currentScreen == Screen.VIDEO_PLAYER) {
-            val pos = (videoView.currentPosition - 10000).coerceAtLeast(0)
-            videoView.seekTo(pos)
-            showVideoHud()
-        } else if (currentScreen == Screen.AUDIO_PLAYER) {
-            audioPlayer?.let { mp ->
-                try {
-                    val pos = (mp.currentPosition - 10000).coerceAtLeast(0)
-                    mp.seekTo(pos)
-                    showAudioHud()
-                } catch (_: Exception) {}
-            }
-        }
-    }
-
-    private fun handleForward10Action() {
-        if (currentScreen == Screen.VIDEO_PLAYER) {
-            val pos = (videoView.currentPosition + 10000).coerceAtMost(videoView.duration)
-            videoView.seekTo(pos)
-            showVideoHud()
-        } else if (currentScreen == Screen.AUDIO_PLAYER) {
-            audioPlayer?.let { mp ->
-                try {
-                    val pos = (mp.currentPosition + 10000).coerceAtMost(mp.duration)
-                    mp.seekTo(pos)
-                    showAudioHud()
-                } catch (_: Exception) {}
-            }
+    private fun handleForward10Action(){
+        if(currentScreen==Screen.VIDEO_PLAYER){
+            cycleForwardSeekSpeed()
+        }else if(currentScreen==Screen.AUDIO_PLAYER){
+            audioPlayer?.let{mp->try{mp.seekTo((mp.currentPosition+10000).coerceAtMost(mp.duration));showAudioHud()}catch(_:Exception){}}
         }
     }
 
@@ -1148,17 +1053,18 @@ class MainActivity : AppCompatActivity() {
         usbHostManager.stop()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        hudHandler.removeCallbacks(hideVideoHudRunnable)
-        hudHandler.removeCallbacks(hideAudioHudRunnable)
-        stopBackgroundService()
+    override fun onDestroy(){
+        hudHandler.removeCallbacks(hideVideoHudRunnable);hudHandler.removeCallbacks(hideAudioHudRunnable);stopBackgroundService()
+        stopAndClearVideoPlayer();stopAndClearAudioPlayer()
+        try{bridge.stop()}catch(_:Throwable){}
+        releaseVlcPlayerCompletely()
+        try{libVlc?.release()}catch(_:Throwable){}
+        vlcPlayer=null
+        libVlc=null
         mediaSession?.release()
-        videoCacheManager.clearCache()
         audioCacheManager.clearCache()
-        lifecycleScope.launch {
-            repository.clear()
-        }
+        lifecycleScope.launch{repository.clear()}
+        super.onDestroy()
     }
 
     private fun startBackgroundService(title: String) {
@@ -1182,6 +1088,396 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var initJob: Job? = null
+
+    private fun initVlc(){
+        if(libVlc==null){
+            libVlc=LibVLC(this,arrayListOf(
+                "--network-caching=250",
+                "--file-caching=250",
+                "--avcodec-hw=any"
+            ))
+        }
+    }
+
+    private fun setVlcPlaybackRate(speed:Float){
+        try{
+            val p=vlcPlayer?:return
+            val m=p.javaClass.methods.firstOrNull{it.name=="setRate"&&it.parameterTypes.size==1}?:return
+            val type=m.parameterTypes[0]
+            val value:Any=when{
+                type==java.lang.Float.TYPE||type==java.lang.Float::class.java->speed
+                type==java.lang.Double.TYPE||type==java.lang.Double::class.java->speed.toDouble()
+                type==java.lang.Integer.TYPE||type==java.lang.Integer::class.java->speed.toInt()
+                else->speed
+            }
+            m.invoke(p,value)
+        }catch(_:Throwable){}
+    }
+
+    private fun getVlcTrackType(typeName:String):Int?{
+        return try{
+            val clazz=Class.forName("org.videolan.libvlc.interfaces.IMedia\$Track\$Type")
+            val field=clazz.getField(if(typeName.equals("audio",true))"Audio" else "Text")
+            field.getInt(null)
+        }catch(_:Throwable){null}
+    }
+
+    private fun readTrackValue(track:Any,names:Array<String>):Any?{
+        for(name in names){
+            try{
+                val fieldName=name.removePrefix("get").replaceFirstChar{it.lowercase()}
+                val field=track.javaClass.fields.firstOrNull{it.name==fieldName}
+                val value=field?.get(track)
+                if(value!=null)return value
+            }catch(_:Throwable){}
+            try{
+                val method=track.javaClass.methods.firstOrNull{it.name==name&&it.parameterTypes.isEmpty()}
+                val value=method?.invoke(track)
+                if(value!=null)return value
+            }catch(_:Throwable){}
+        }
+        return null
+    }
+
+    private data class VlcTrackChoice(val id:String,val label:String)
+
+    private fun parseVlcTrackResult(result:Any?):List<VlcTrackChoice>{
+        if(result==null)return emptyList()
+        val items=when(result){
+            is Array<*>->result.asList()
+            is Iterable<*>->result.toList()
+            else->emptyList<Any?>()
+        }
+        val out=mutableListOf<VlcTrackChoice>()
+        for((index,track) in items.withIndex()){
+            if(track==null)continue
+            val id=readTrackValue(track,arrayOf("id","getId"))?.toString()?.takeIf{it.isNotBlank()}?:continue
+            if(id=="-1")continue
+            val name=readTrackValue(track,arrayOf("name","getName"))?.toString()?.trim().orEmpty()
+            val language=readTrackValue(track,arrayOf("language","getLanguage"))?.toString()?.trim().orEmpty()
+            val description=readTrackValue(track,arrayOf("description","getDescription"))?.toString()?.trim().orEmpty()
+            val label=when{
+                name.isNotBlank()->name
+                description.isNotBlank()->description
+                language.isNotBlank()->language
+                else->"Track "+(index+1)
+            }
+            val selected=(readTrackValue(track,arrayOf("selected","isSelected","getSelected")) as? Boolean)==true
+            val shownLabel=if(selected)"✓ "+label else label
+            out.add(VlcTrackChoice(id,shownLabel))
+        }
+        return out
+    }
+
+    private fun getVlcTracks(typeName:String):List<VlcTrackChoice>{
+        val p=vlcPlayer?:return emptyList()
+        val type=getVlcTrackType(typeName)?:return emptyList()
+        return try{
+            val method=p.javaClass.methods.firstOrNull{
+                it.name=="getTracks"&&it.parameterTypes.size==1&&
+                    (it.parameterTypes[0]==Integer.TYPE||it.parameterTypes[0]==Integer::class.java)
+            }?:return emptyList()
+            parseVlcTrackResult(method.invoke(p,type))
+        }catch(e:Throwable){
+            Log.w(PtpConstants.TAG,"Could not read VLC "+typeName+" tracks",e)
+            emptyList()
+        }
+    }
+
+    private fun setVlcTrack(trackId:String){
+        val p=vlcPlayer?:return
+        try{
+            val method=p.javaClass.methods.firstOrNull{
+                it.name=="selectTrack"&&it.parameterTypes.size==1&&it.parameterTypes[0]==String::class.java
+            }
+            method?.invoke(p,trackId)
+        }catch(e:Throwable){
+            Log.w(PtpConstants.TAG,"Could not select VLC track "+trackId,e)
+        }
+    }
+
+    private fun unselectVlcTrack(typeName:String){
+        val p=vlcPlayer?:return
+        val type=getVlcTrackType(typeName)?:return
+        try{
+            val method=p.javaClass.methods.firstOrNull{
+                it.name=="unselectTrackType"&&it.parameterTypes.size==1&&
+                    (it.parameterTypes[0]==Integer.TYPE||it.parameterTypes[0]==Integer::class.java)
+            }
+            method?.invoke(p,type)
+        }catch(e:Throwable){
+            Log.w(PtpConstants.TAG,"Could not unselect VLC "+typeName+" track",e)
+        }
+    }
+
+    private fun refreshVlcTrackButtonsSoon(sessionId:Long){
+        lifecycleScope.launch{
+            repeat(12){attempt->
+                delay(if(attempt==0)250L else 400L)
+                if(sessionId!=currentVideoSessionId||currentScreen!=Screen.VIDEO_PLAYER)return@launch
+                val audio=getVlcTracks("audio")
+                val subs=getVlcTracks("subtitle")
+                if(audio.isNotEmpty())btnVideoAudioTrack.text="🔊 AUDIO ("+audio.size+")"
+                if(subs.isNotEmpty())btnVideoSubs.text="💬 SUBS ("+subs.size+")"
+                if(audio.isNotEmpty()||subs.isNotEmpty())return@launch
+            }
+        }
+    }
+
+    private fun showSubtitlesDialog(){
+        lifecycleScope.launch{
+            var tracks=emptyList<VlcTrackChoice>()
+            repeat(12){attempt->
+                tracks=getVlcTracks("subtitle")
+                if(tracks.isNotEmpty())return@repeat
+                delay(if(attempt==0)150L else 300L)
+            }
+            if(tracks.isEmpty()){
+                Toast.makeText(this@MainActivity,"No subtitle tracks found in this video",Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val labels=arrayOf("Subtitles: Off")+tracks.map{it.label}
+            AlertDialog.Builder(this@MainActivity).setTitle(getString(R.string.subtitles_track)).setItems(labels){d,which->
+                if(which==0){
+                    unselectVlcTrack("subtitle")
+                    btnVideoSubs.text="💬 SUBS"
+                }else{
+                    val t=tracks[which-1]
+                    setVlcTrack(t.id)
+                    btnVideoSubs.text="💬 "+t.label
+                }
+                d.dismiss()
+                btnVideoSubs.requestFocus()
+            }.setNegativeButton("CANCEL",null).show()
+        }
+    }
+
+    private fun showAudioTrackDialog(){
+        lifecycleScope.launch{
+            var tracks=emptyList<VlcTrackChoice>()
+            repeat(12){attempt->
+                tracks=getVlcTracks("audio")
+                if(tracks.isNotEmpty())return@repeat
+                delay(if(attempt==0)150L else 300L)
+            }
+            if(tracks.isEmpty()){
+                Toast.makeText(this@MainActivity,"No audio tracks found in this video",Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val labels=tracks.map{it.label}.toTypedArray()
+            AlertDialog.Builder(this@MainActivity).setTitle(getString(R.string.audio_track)).setItems(labels){d,which->
+                val t=tracks[which]
+                setVlcTrack(t.id)
+                btnVideoAudioTrack.text="🔊 "+t.label
+                d.dismiss()
+                btnVideoAudioTrack.requestFocus()
+            }.setNegativeButton("CANCEL",null).show()
+        }
+    }
+
+    private fun installVlcEventListener(player: VlcMediaPlayer, sessionId: Long){
+        player.setEventListener{event->runOnUiThread{
+            try{
+                if(player!==vlcPlayer||sessionId!=currentVideoSessionId||currentScreen!=Screen.VIDEO_PLAYER)return@runOnUiThread
+                when(event.type){
+                    VlcMediaPlayer.Event.Playing->{
+                        tvVideoError.visibility=View.GONE
+                        btnVideoPlayPause.text="⏸ PAUSE"
+                        if(!isVlcSeeking){layoutVideoBuffering.visibility=View.GONE}
+                        resetVideoHudTimer()
+                        updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,player.time)
+                    }
+                    VlcMediaPlayer.Event.Paused->{
+                        if(!isVlcSeeking){layoutVideoBuffering.visibility=View.GONE}
+                        btnVideoPlayPause.text="▶ PLAY"
+                        showVideoHud()
+                        updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,player.time)
+                    }
+                    VlcMediaPlayer.Event.Buffering->{
+                        val pct=event.getBuffering().toInt().coerceIn(0,100)
+                        if(pct<100||isVlcSeeking){
+                            layoutVideoBuffering.visibility=View.VISIBLE
+                            tvBuffering.text=if(isVlcSeeking)"Seeking / buffering..." else "Buffering "+pct+"%"
+                        }else{
+                            isVlcSeeking=false
+                            layoutVideoBuffering.visibility=View.GONE
+                        }
+                    }
+                    VlcMediaPlayer.Event.EncounteredError->{
+                        isVlcSeeking=false
+                        layoutVideoBuffering.visibility=View.GONE
+                        tvVideoError.text="Video could not be loaded from the phone"
+                        tvVideoError.visibility=View.VISIBLE
+                        btnVideoPlayPause.text="▶ PLAY"
+                        showVideoHud()
+                        updateMediaSessionState(PlaybackStateCompat.STATE_ERROR,try{player.time}catch(_:Throwable){0L})
+                    }
+                    VlcMediaPlayer.Event.EndReached->{
+                        isVlcSeeking=false
+                        isForwardSeekMode=false
+                        isReverseSeekMode=false
+                        reverseSeekJob?.cancel()
+                        reverseSeekJob=null
+                        updateSeekModeButtons()
+                        layoutVideoBuffering.visibility=View.GONE
+                        when(videoLoopMode){
+                            LoopMode.OFF->{
+                                if(currentVideoIndex<displayedVideoList.size-1)playVideoAtIndex(currentVideoIndex+1)
+                                else{btnVideoPlayPause.text="▶ PLAY";showVideoHud();updateMediaSessionState(PlaybackStateCompat.STATE_STOPPED,try{player.length}catch(_:Throwable){0L})}
+                            }
+                            LoopMode.SINGLE->{try{player.setTime(0L);player.play()}catch(_:Throwable){}}
+                            LoopMode.ALL->{if(displayedVideoList.isNotEmpty())playVideoAtIndex((currentVideoIndex+1)%displayedVideoList.size)}
+                        }
+                    }
+                }
+            }catch(e:Throwable){Log.w(PtpConstants.TAG,"VLC UI event handling failed",e)}
+        }}
+    }
+
+    private fun createVlcPlayer(sessionId:Long):VlcMediaPlayer?{
+        val engine=libVlc?:return null
+        val player=try{
+            vlcPlayer?:VlcMediaPlayer(engine).also{vlcPlayer=it}
+        }catch(e:Throwable){
+            Log.e(PtpConstants.TAG,"Could not create VLC player",e)
+            return null
+        }
+        installVlcEventListener(player,sessionId)
+        try{
+            if(!vlcViewsAttached){
+                player.attachViews(videoLayout,null,true,false)
+                vlcViewsAttached=true
+            }
+        }catch(e:Throwable){
+            Log.e(PtpConstants.TAG,"Could not attach VLC video view",e)
+        }
+        return player
+    }
+
+    private fun releaseVlcPlayerForSwitch(){
+        isVlcSeeking=false
+        seekRequestId += 1L
+        reverseSeekJob?.cancel()
+        reverseSeekJob=null
+        isReverseSeekMode=false
+        isForwardSeekMode=false
+        forwardSeekSpeed=1.0f
+        bridge.invalidatePlayback()
+        updateSeekModeButtons()
+        try{vlcPlayer?.stop()}catch(_:Throwable){}
+    }
+
+    private fun startVideoPlayback(item:PtpMediaItem){
+        val sessionId=++currentVideoSessionId
+        videoProgressJob?.cancel()
+        releaseVlcPlayerForSwitch()
+        showScreen(Screen.VIDEO_PLAYER)
+        tvVideoError.visibility=View.GONE
+        tvVideoError.text=""
+        tvVideoTitle.text=item.displayName
+        tvVideoBadgeFormat.text=item.filename.substringAfterLast(".","VIDEO").uppercase()
+        tvVideoTimeCurrent.text="00:00"
+        tvVideoTimeTotal.text="00:00"
+        sbVideoSeek.progress=0
+        btnVideoPlayPause.text="⏸ PAUSE"
+        btnVideoSubs.text="💬 SUBS"
+        btnVideoAudioTrack.text="🔊 AUDIO"
+        currentSubtitlesTrack=-1
+        currentPlaybackSpeed=1.0f
+        setPlaybackSpeed(1.0f)
+        updateLoopButtonUi()
+        updateSeekModeButtons()
+        tvBuffering.text=getString(R.string.buffering)
+        layoutVideoBuffering.visibility=View.VISIBLE
+        showVideoHud()
+
+        val engine=libVlc
+        if(engine==null||bridge.port<=0){
+            layoutVideoBuffering.visibility=View.GONE
+            tvVideoError.text=getString(R.string.video_load_failed)
+            tvVideoError.visibility=View.VISIBLE
+            btnVideoPlayPause.text="▶ PLAY"
+            return
+        }
+
+        bridge.beginPlayback(item.handle)
+        val p=createVlcPlayer(sessionId)
+        if(p==null){
+            bridge.invalidatePlayback()
+            layoutVideoBuffering.visibility=View.GONE
+            tvVideoError.text=getString(R.string.video_load_failed)
+            tvVideoError.visibility=View.VISIBLE
+            btnVideoPlayPause.text="▶ PLAY"
+            return
+        }
+
+        val oldMedia=currentVlcMedia
+        try{
+            val media=Media(engine,Uri.parse(bridge.urlFor(item))).apply{
+                addOption(":http-reconnect=true")
+                addOption(":network-caching=250")
+                addOption(":file-caching=250")
+            }
+            currentVlcMedia=media
+            p.setMedia(media)
+            try{oldMedia?.release()}catch(_:Throwable){}
+            p.play()
+            startVideoProgressLoop(sessionId)
+            refreshVlcTrackButtonsSoon(sessionId)
+        }catch(e:Throwable){
+            try{currentVlcMedia?.release()}catch(_:Throwable){}
+            currentVlcMedia=null
+            if(sessionId==currentVideoSessionId){
+                Log.e(PtpConstants.TAG,"Failed to open PTP media in VLC",e)
+                bridge.invalidatePlayback()
+                layoutVideoBuffering.visibility=View.GONE
+                tvVideoError.text=getString(R.string.video_load_failed)
+                tvVideoError.visibility=View.VISIBLE
+                btnVideoPlayPause.text="▶ PLAY"
+            }
+        }
+    }
+
+    private fun startVideoProgressLoop(sessionId:Long=currentVideoSessionId){
+        videoProgressJob?.cancel()
+        videoProgressJob=lifecycleScope.launch{
+            while(currentScreen==Screen.VIDEO_PLAYER&&sessionId==currentVideoSessionId){
+                try{
+                    val p=vlcPlayer
+                    if(p!=null&&p.length>0&&!isVideoTracking){
+                        val total=p.length
+                        if(total>0){
+                            sbVideoSeek.progress=(p.position*1000f).toInt().coerceIn(0,1000)
+                            tvVideoTimeCurrent.text=formatTime(p.time.toInt().coerceAtLeast(0))
+                            tvVideoTimeTotal.text=formatTime(total.toInt().coerceAtLeast(0))
+                        }
+                    }
+                }catch(_:Throwable){}
+                delay(300)
+            }
+        }
+    }
+
+    private fun stopAndClearVideoPlayer(){
+        currentVideoSessionId++
+        hudHandler.removeCallbacks(hideVideoHudRunnable)
+        videoProgressJob?.cancel()
+        releaseVlcPlayerForSwitch()
+        try{currentVlcMedia?.release()}catch(_:Throwable){}
+        currentVlcMedia=null
+        layoutVideoBuffering.visibility=View.GONE
+        tvVideoError.visibility=View.GONE
+        tvVideoError.text=""
+        updateMediaSessionState(PlaybackStateCompat.STATE_NONE,0L)
+    }
+
+    private fun releaseVlcPlayerCompletely(){
+        releaseVlcPlayerForSwitch()
+        try{vlcPlayer?.detachViews()}catch(_:Throwable){}
+        try{vlcPlayer?.release()}catch(_:Throwable){}
+        vlcPlayer=null
+        vlcViewsAttached=false
+    }
 
     private fun handleUsbState(state: UsbConnectionState) {
         when (state) {
@@ -1236,7 +1532,6 @@ class MainActivity : AppCompatActivity() {
                 stopAndClearAudioPlayer()
                 stopBackgroundService()
                 photoLoadJob?.cancel()
-                videoCachingJob?.cancel()
                 audioCachingJob?.cancel()
                 audioProgressJob?.cancel()
                 legacyPhotoThumbLoader.clear()
@@ -1315,205 +1610,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun playVideoAtIndex(index: Int) {
-        if (index < 0 || index >= displayedVideoList.size) return
-        currentVideoIndex = index
-        val item = displayedVideoList[index]
-        startVideoPlayback(item)
-    }
-
-    private fun startVideoPlayback(item: PtpMediaItem) {
-        val client = repository.client ?: return
-        val sessionId = ++currentVideoSessionId
-
-        // Cancel previous jobs and buffering immediately
-        videoCachingJob?.cancel()
-        videoProgressJob?.cancel()
-        videoCacheManager.cancelBuffering()
-        try {
-            videoView.stopPlayback()
-        } catch (_: Exception) {}
-        currentVideoPlayer = null
-
-        showScreen(Screen.VIDEO_PLAYER)
-
-        // Reset UI state
-        tvVideoError.visibility = View.GONE
-        tvVideoError.text = ""
-        tvVideoTitle.text = item.displayName
-        tvVideoBadgeFormat.text = item.filename.substringAfterLast('.', "VIDEO").uppercase()
-        tvVideoTimeCurrent.text = "00:00"
-        tvVideoTimeTotal.text = "00:00"
-        sbVideoSeek.progress = 0
-        btnVideoPlayPause.text = "⏸ PAUSE"
-        currentPlaybackSpeed = 1.0f
-        setPlaybackSpeed(1.0f)
-        updateLoopButtonUi()
-
-        tvBuffering.text = getString(R.string.buffering)
-        layoutVideoBuffering.visibility = View.VISIBLE
-        showVideoHud()
-
-        var playbackInitialized = false
-
-        val initPlayback = { file: File ->
-            if (sessionId == currentVideoSessionId && !playbackInitialized && file.exists() && file.length() > 0) {
-                playbackInitialized = true
-                try {
-                    videoView.setVideoPath(file.absolutePath)
-                    videoView.setOnPreparedListener { mp ->
-                        if (sessionId != currentVideoSessionId) return@setOnPreparedListener
-                        currentVideoPlayer = mp
-                        tvVideoError.visibility = View.GONE
-                        layoutVideoBuffering.visibility = View.GONE
-
-                        mp.isLooping = (videoLoopMode == LoopMode.SINGLE)
-                        setPlaybackSpeed(currentPlaybackSpeed)
-                        videoView.start()
-                        btnVideoPlayPause.text = "⏸ PAUSE"
-
-                        val duration = videoView.duration
-                        if (duration > 0) {
-                            tvVideoTimeTotal.text = formatTime(duration)
-                        }
-
-                        updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, 0L)
-                        startVideoProgressLoop(sessionId)
-                        resetVideoHudTimer()
-                    }
-
-                    videoView.setOnErrorListener { _, what, extra ->
-                        if (sessionId != currentVideoSessionId) return@setOnErrorListener true
-                        Log.e(PtpConstants.TAG, "VideoView playback error: what=$what extra=$extra")
-                        layoutVideoBuffering.visibility = View.GONE
-                        tvVideoError.text = getString(R.string.video_codec_unsupported)
-                        tvVideoError.visibility = View.VISIBLE
-                        showVideoHud()
-                        btnVideoPlayPause.text = "▶ PLAY"
-                        updateMediaSessionState(PlaybackStateCompat.STATE_ERROR, 0L)
-                        true
-                    }
-
-                    videoView.setOnCompletionListener {
-                        if (sessionId != currentVideoSessionId) return@setOnCompletionListener
-                        updateMediaSessionState(PlaybackStateCompat.STATE_STOPPED, videoView.duration.toLong())
-                        when (videoLoopMode) {
-                            LoopMode.OFF -> {
-                                btnVideoPlayPause.text = "▶ PLAY"
-                                showVideoHud()
-                                if (currentVideoIndex < displayedVideoList.size - 1) {
-                                    playVideoAtIndex(currentVideoIndex + 1)
-                                }
-                            }
-                            LoopMode.SINGLE -> {
-                                videoView.seekTo(0)
-                                videoView.start()
-                            }
-                            LoopMode.ALL -> {
-                                val nextIdx = (currentVideoIndex + 1) % displayedVideoList.size
-                                playVideoAtIndex(nextIdx)
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    if (sessionId == currentVideoSessionId) {
-                        Log.e(PtpConstants.TAG, "Exception initializing VideoView", e)
-                        layoutVideoBuffering.visibility = View.GONE
-                        tvVideoError.text = getString(R.string.video_codec_unsupported)
-                        tvVideoError.visibility = View.VISIBLE
-                        showVideoHud()
-                    }
-                }
-            }
-        }
-
-        videoCachingJob = lifecycleScope.launch {
-            videoCacheManager.streamVideoProgressive(
-                client = client,
-                handle = item.handle,
-                filename = item.filename,
-                totalSizeBytes = item.sizeBytes,
-                sessionId = sessionId,
-                initialThresholdBytes = 6 * 1024 * 1024L,
-                onInitialBufferReady = { file, _, _ ->
-                    withContext(Dispatchers.Main) {
-                        if (sessionId == currentVideoSessionId) {
-                            initPlayback(file)
-                        }
-                    }
-                },
-                onProgress = { written, total ->
-                    lifecycleScope.launch(Dispatchers.Main) {
-                        if (sessionId == currentVideoSessionId && layoutVideoBuffering.visibility == View.VISIBLE) {
-                            val mb = written / (1024.0 * 1024.0)
-                            if (total > 0) {
-                                val totalMb = total / (1024.0 * 1024.0)
-                                tvBuffering.text = String.format("Buffering %.1f / %.1f MB...", mb, totalMb)
-                            } else {
-                                tvBuffering.text = String.format("Buffering %.1f MB...", mb)
-                            }
-                        }
-                    }
-                },
-                onComplete = { file ->
-                    withContext(Dispatchers.Main) {
-                        if (sessionId == currentVideoSessionId) {
-                            initPlayback(file)
-                        }
-                    }
-                },
-                onError = { ex ->
-                    withContext(Dispatchers.Main) {
-                        if (sessionId == currentVideoSessionId && !playbackInitialized) {
-                            layoutVideoBuffering.visibility = View.GONE
-                            tvVideoError.text = getString(R.string.video_load_failed)
-                            tvVideoError.visibility = View.VISIBLE
-                            showVideoHud()
-                        }
-                    }
-                }
-            )
-        }
-    }
-
-    private fun startVideoProgressLoop(sessionId: Long = currentVideoSessionId) {
-        videoProgressJob?.cancel()
-        videoProgressJob = lifecycleScope.launch {
-            while (currentScreen == Screen.VIDEO_PLAYER && sessionId == currentVideoSessionId) {
-                try {
-                    if (videoView.isPlaying && !isVideoTracking) {
-                        if (tvVideoError.visibility == View.VISIBLE) {
-                            tvVideoError.visibility = View.GONE
-                        }
-                        val current = videoView.currentPosition
-                        val total = videoView.duration
-                        if (total > 0) {
-                            val ratio = (current.toLong() * 1000L / total).toInt()
-                            sbVideoSeek.progress = ratio
-                            tvVideoTimeCurrent.text = formatTime(current)
-                            tvVideoTimeTotal.text = formatTime(total)
-                        }
-                    }
-                } catch (_: Exception) {}
-                delay(500)
-            }
-        }
-    }
-
-    private fun stopAndClearVideoPlayer() {
-        currentVideoSessionId++
-        hudHandler.removeCallbacks(hideVideoHudRunnable)
-        videoProgressJob?.cancel()
-        videoCachingJob?.cancel()
-        videoCacheManager.cancelBuffering()
-        try {
-            videoView.setOnPreparedListener(null)
-            videoView.setOnErrorListener(null)
-            videoView.setOnCompletionListener(null)
-            videoView.stopPlayback()
-        } catch (_: Exception) {}
-        currentVideoPlayer = null
-        layoutVideoBuffering.visibility = View.GONE
-        updateMediaSessionState(PlaybackStateCompat.STATE_NONE, 0L)
+        if(index<0||index>=displayedVideoList.size)return
+        currentVideoIndex=index
+        startVideoPlayback(displayedVideoList[index])
     }
 
     fun playAudioAtIndex(index: Int) {
@@ -1692,6 +1791,9 @@ class MainActivity : AppCompatActivity() {
         audioCacheManager.cancelBuffering()
         stopAudioPlaybackOnly()
         layoutAudioBuffering.visibility = View.GONE
+        tvAudioError.visibility = View.GONE
+        tvAudioError.text = ""
+        tvAudioPlayerStatus.text = ""
         audioCacheManager.clearCache()
     }
 
@@ -1902,8 +2004,17 @@ class PhotoAdapter(
     private val onItemMenu: (PtpMediaItem) -> Unit
 ) : RecyclerView.Adapter<PhotoViewHolder>() {
 
+    companion object {
+        const val VIEW_TYPE_GRID = 0
+        const val VIEW_TYPE_LIST = 1
+    }
+
+    override fun getItemViewType(position: Int): Int {
+        return if (isListView()) VIEW_TYPE_LIST else VIEW_TYPE_GRID
+    }
+
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PhotoViewHolder {
-        val layoutId = if (isListView()) R.layout.item_photo_list else R.layout.item_photo
+        val layoutId = if (viewType == VIEW_TYPE_LIST) R.layout.item_photo_list else R.layout.item_photo
         val view = LayoutInflater.from(parent.context).inflate(layoutId, parent, false)
         return PhotoViewHolder(view)
     }
@@ -1943,8 +2054,17 @@ class VideoAdapter(
     private val onItemMenu: (PtpMediaItem) -> Unit
 ) : RecyclerView.Adapter<VideoViewHolder>() {
 
+    companion object {
+        const val VIEW_TYPE_GRID = 0
+        const val VIEW_TYPE_LIST = 1
+    }
+
+    override fun getItemViewType(position: Int): Int {
+        return if (isListView()) VIEW_TYPE_LIST else VIEW_TYPE_GRID
+    }
+
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VideoViewHolder {
-        val layoutId = if (isListView()) R.layout.item_video_list else R.layout.item_video
+        val layoutId = if (viewType == VIEW_TYPE_LIST) R.layout.item_video_list else R.layout.item_video
         val view = LayoutInflater.from(parent.context).inflate(layoutId, parent, false)
         return VideoViewHolder(view)
     }
@@ -1990,8 +2110,17 @@ class AudioAdapter(
     private val onItemMenu: (PtpMediaItem) -> Unit
 ) : RecyclerView.Adapter<AudioViewHolder>() {
 
+    companion object {
+        const val VIEW_TYPE_GRID = 0
+        const val VIEW_TYPE_LIST = 1
+    }
+
+    override fun getItemViewType(position: Int): Int {
+        return if (isListView()) VIEW_TYPE_LIST else VIEW_TYPE_GRID
+    }
+
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): AudioViewHolder {
-        val layoutId = if (isListView()) R.layout.item_audio_list else R.layout.item_audio
+        val layoutId = if (viewType == VIEW_TYPE_LIST) R.layout.item_audio_list else R.layout.item_audio
         val view = LayoutInflater.from(parent.context).inflate(layoutId, parent, false)
         return AudioViewHolder(view)
     }
