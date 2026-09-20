@@ -644,6 +644,27 @@ class PtpClient(
         return if (resp.isOk) payload else null
     }
 
+    /**
+     * Get Partial Object using the 64-bit offset operation where supported.
+     *
+     * Parameters are encoded as handle, offset-low, offset-high, max-bytes.
+     * The normal GetPartialObject path remains available for wider device
+     * compatibility and is attempted first by the seekable data source.
+     */
+    suspend fun getPartialObject64(handle: Int, offset: Long, maxBytes: Int): ByteArray? {
+        if (offset < 0L || maxBytes <= 0) return null
+
+        val offsetLow = (offset and 0xFFFFFFFFL).toInt()
+        val offsetHigh = ((offset ushr 32) and 0xFFFFFFFFL).toInt()
+        val (resp, payload) = executeDataCommand(
+            PtpConstants.OPERATION_GET_PARTIAL_OBJECT_64,
+            handle,
+            offsetLow,
+            offsetHigh,
+            maxBytes
+        )
+        return if (resp.isOk) payload else null
+    }
     companion object {
         fun calculateInSampleSize(
             options: BitmapFactory.Options,
