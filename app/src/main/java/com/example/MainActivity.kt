@@ -457,6 +457,98 @@ class MainActivity : AppCompatActivity() {
         usbHostManager=UsbHostManager(this){state->handleUsbState(state)}
     }
 
+    private fun setupPhotosBrowserControls() {
+        rvPhotos.layoutManager = GridLayoutManager(this, 4)
+        btnPhotosViewMode.setOnClickListener {
+            val isNowList = (photoViewMode == ViewMode.GRID)
+            photoViewMode = if (isNowList) ViewMode.LIST else ViewMode.GRID
+            btnPhotosViewMode.text = if (isNowList) "☰ LIST" else "▦ GRID"
+            rvPhotos.recycledViewPool.clear()
+            rvPhotos.layoutManager = if (isNowList) LinearLayoutManager(this) else GridLayoutManager(this, 4)
+            photoAdapter.notifyDataSetChanged()
+        }
+        btnPhotosSort.setOnClickListener {
+            showSortDialog("Photos", photoSortMode) { selected ->
+                photoSortMode = selected
+                btnPhotosSort.text = "⫽ ${selected.name.replace('_', ' ')}"
+                applySorting()
+            }
+        }
+    }
+
+    private fun setupVideosBrowserControls() {
+        rvVideos.layoutManager = GridLayoutManager(this, 4)
+        btnVideosViewMode.setOnClickListener {
+            val isNowList = (videoViewMode == ViewMode.GRID)
+            videoViewMode = if (isNowList) ViewMode.LIST else ViewMode.GRID
+            btnVideosViewMode.text = if (isNowList) "☰ LIST" else "▦ GRID"
+            rvVideos.recycledViewPool.clear()
+            rvVideos.layoutManager = if (isNowList) LinearLayoutManager(this) else GridLayoutManager(this, 4)
+            videoAdapter.notifyDataSetChanged()
+        }
+        btnVideosSort.setOnClickListener {
+            showSortDialog("Videos", videoSortMode) { selected ->
+                videoSortMode = selected
+                btnVideosSort.text = "⫽ ${selected.name.replace('_', ' ')}"
+                applySorting()
+            }
+        }
+    }
+
+    private fun setupAudioBrowserControls() {
+        rvAudio.layoutManager = GridLayoutManager(this, 4)
+        btnAudioViewMode.setOnClickListener {
+            val isNowList = (audioViewMode == ViewMode.GRID)
+            audioViewMode = if (isNowList) ViewMode.LIST else ViewMode.GRID
+            btnAudioViewMode.text = if (isNowList) "☰ LIST" else "▦ GRID"
+            rvAudio.recycledViewPool.clear()
+            rvAudio.layoutManager = if (isNowList) LinearLayoutManager(this) else GridLayoutManager(this, 4)
+            audioAdapter.notifyDataSetChanged()
+        }
+        btnAudioSort.setOnClickListener {
+            showSortDialog("Audio", audioSortMode) { selected ->
+                audioSortMode = selected
+                btnAudioSort.text = "⫽ ${selected.name.replace('_', ' ')}"
+                applySorting()
+            }
+        }
+    }
+
+    private fun showSortDialog(title: String, current: SortMode, onSelected: (SortMode) -> Unit) {
+        val modes = SortMode.values()
+        val names = arrayOf("Default", "Name (A-Z)", "Size (Largest First)", "Newest First")
+        val currentIdx = modes.indexOf(current).coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("Sort $title")
+            .setSingleChoiceItems(names, currentIdx) { dialog, which ->
+                onSelected(modes[which])
+                dialog.dismiss()
+            }
+            .setNegativeButton("CANCEL", null)
+            .show()
+    }
+
+    private fun applySorting() {
+        displayedPhotoList.clear()
+        displayedPhotoList.addAll(sortItems(repository.photoItems, photoSortMode))
+        photoAdapter.notifyDataSetChanged()
+        displayedVideoList.clear()
+        displayedVideoList.addAll(sortItems(repository.videoItems, videoSortMode))
+        videoAdapter.notifyDataSetChanged()
+        displayedAudioList.clear()
+        displayedAudioList.addAll(sortItems(repository.audioItems, audioSortMode))
+        audioAdapter.notifyDataSetChanged()
+    }
+
+    private fun sortItems(items: List<PtpMediaItem>, sortMode: SortMode): List<PtpMediaItem> {
+        return when (sortMode) {
+            SortMode.DEFAULT -> items.toList()
+            SortMode.NAME_ASC -> items.sortedBy { it.displayName.lowercase() }
+            SortMode.SIZE_DESC -> items.sortedByDescending { it.sizeBytes }
+            SortMode.DATE_DESC -> items.sortedByDescending { it.handle }
+        }
+    }
+
     private fun initMediaSession() {
         try {
             mediaSession = MediaSessionCompat(this, "DirectUSB_MediaSession").apply {
@@ -1052,11 +1144,6 @@ class MainActivity : AppCompatActivity() {
         currentVlcMedia?.release();currentVlcMedia=null
         layoutVideoBuffering.visibility=View.GONE;tvVideoError.visibility=View.GONE;tvVideoError.text=""
         updateMediaSessionState(PlaybackStateCompat.STATE_NONE,0L)
-    }
-
-    fun playAudioAtIndex(index:Int){
-        if(index<0||index>=displayedAudioList.size)return
-        currentAudioIndex=index;startAudioPlayback(displayedAudioList[index])
     }
 
     fun playAudioAtIndex(index: Int) {
