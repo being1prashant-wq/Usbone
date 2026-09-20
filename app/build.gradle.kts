@@ -4,14 +4,12 @@ plugins {
   alias(libs.plugins.android.application)
 }
 
-// Ensure debug.keystore exists before signing config evaluation (especially on CI / GitHub Actions)
 val debugKeystoreFile = file("${rootDir}/debug.keystore")
 if (!debugKeystoreFile.exists() || debugKeystoreFile.length() == 0L) {
   val base64File = file("${rootDir}/debug.keystore.base64")
   if (base64File.exists() && base64File.length() > 0L) {
     try {
-      val decoded = Base64.getDecoder().decode(base64File.readText().trim())
-      debugKeystoreFile.writeBytes(decoded)
+      debugKeystoreFile.writeBytes(Base64.getDecoder().decode(base64File.readText().trim()))
     } catch (_: Throwable) {}
   }
 }
@@ -24,9 +22,8 @@ android {
     applicationId = "com.aistudio.directusb.mtptv"
     minSdk = 28
     targetSdk = 36
-    versionCode = 2
-    versionName = "2.0.0"
-
+    versionCode = 3
+    versionName = "3.0.0-vlc-ptp"
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
@@ -67,7 +64,6 @@ android {
   }
 
   testOptions { unitTests { isIncludeAndroidResources = true } }
-
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
@@ -81,6 +77,9 @@ dependencies {
   implementation(libs.androidx.media)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
+
+  // VLC 4 engine / Android bindings.
+  implementation("org.videolan.android:libvlc-all:4.0.0-eap29")
 
   testImplementation(libs.junit)
   testImplementation(libs.androidx.junit)
