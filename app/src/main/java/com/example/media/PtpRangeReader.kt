@@ -16,7 +16,9 @@ class PtpRangeReader(private val client: PtpClient) {
         )
         if (resp64.isOk && payload64 != null) return payload64
 
-        if (offset <= Int.MAX_VALUE.toLong()) {
+        // PTP's normal partial-object offset is an unsigned 32-bit value.
+        // Kotlin Int is signed, but the raw bits are still encoded correctly.
+        if (offset <= 0xFFFFFFFFL) {
             return client.getPartialObject(handle, offset.toInt(), safeLength)
         }
         return null
