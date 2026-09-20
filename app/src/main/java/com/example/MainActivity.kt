@@ -1116,7 +1116,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun getVlcTrackType(typeName:String):Int?{
         return try{
-            val clazz=Class.forName("org.videolan.libvlc.interfaces.IMedia$Track$Type")
+            val clazz=Class.forName("org.videolan.libvlc.interfaces.IMedia\$Track\$Type")
             val field=clazz.getField(if(typeName.equals("audio",true))"Audio" else "Text")
             field.getInt(null)
         }catch(_:Throwable){null}
