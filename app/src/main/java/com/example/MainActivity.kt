@@ -458,7 +458,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initMediaSession() {
-    private fun initMediaSession() {
         try {
             mediaSession = MediaSessionCompat(this, "DirectUSB_MediaSession").apply {
                 setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
