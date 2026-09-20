@@ -20,6 +20,8 @@ class PtpLoopbackServer(
 ) {
     private var server: ServerSocket? = null
     private var acceptJob: Job? = null
+    @Volatile private var activePlaybackToken: Long = 0L
+    @Volatile private var activeHandle: Int = -1
 
     val port: Int
         get() = server?.localPort ?: -1
@@ -49,13 +51,24 @@ class PtpLoopbackServer(
         server = null
     }
 
+    fun beginPlayback(handle: Int): Long {
+        activeHandle = handle
+        activePlaybackToken += 1L
+        return activePlaybackToken
+    }
+
+    fun invalidatePlayback() {
+        activeHandle = -1
+        activePlaybackToken += 1L
+    }
+
     fun urlFor(item: PtpMediaItem): String {
         return "http://127.0.0.1:" + port + "/ptp/" + item.handle
     }
 
     private suspend fun handle(socket: Socket) {
         socket.use { s ->
-            s.soTimeout = 15000
+            s.soTimeout = 30000
             val input = BufferedInputStream(s.getInputStream(), 8192)
             val output = BufferedOutputStream(s.getOutputStream(), 8192)
 
@@ -90,9 +103,15 @@ class PtpLoopbackServer(
             }
 
             val handle = parts[1].toIntOrNull()
+            val requestToken = activePlaybackToken
             val item = handle?.let { findItem(it) }
             if (handle == null || item == null || item.sizeBytes <= 0L) {
                 writeStatus(output, 404, "Not Found", 0L, null)
+                return
+            }
+
+            if (handle != activeHandle || requestToken != activePlaybackToken) {
+                writeStatus(output, 409, "Playback Changed", 0L, null)
                 return
             }
 
@@ -135,6 +154,10 @@ class PtpLoopbackServer(
             var remaining = length
 
             while (remaining > 0L) {
+                if (requestToken != activePlaybackToken || handle != activeHandle) {
+                    break
+                }
+
                 val ask = minOf(PtpRangeReader.MAX_CHUNK.toLong(), remaining).toInt()
                 val bytes = reader.readAt(handle, offset, ask) ?: break
                 if (bytes.isEmpty()) break
@@ -144,7 +167,9 @@ class PtpLoopbackServer(
                 offset += bytes.size
                 remaining -= bytes.size.toLong()
 
-                if (bytes.size < ask) break
+                // A PTP device is allowed to return less than the requested
+                // amount. Keep reading until the HTTP range is fully satisfied
+                // instead of producing a truncated Content-Length response.
             }
         }
     }
