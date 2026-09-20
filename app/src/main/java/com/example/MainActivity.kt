@@ -194,6 +194,8 @@ class MainActivity : AppCompatActivity() {
     private var libVlc: LibVLC? = null
     private var vlcPlayer: VlcMediaPlayer? = null
     private var currentVlcMedia: Media? = null
+    private var vlcGenerationCounter: Long = 0L
+    private var isVlcSeeking: Boolean = false
 
     // Storage Permission Handling for TV copy
     private var storagePermissionCallback: ((Boolean) -> Unit)? = null
@@ -610,15 +612,41 @@ class MainActivity : AppCompatActivity() {
         sbVideoSeek.setOnSeekBarChangeListener(object:SeekBar.OnSeekBarChangeListener{
             override fun onProgressChanged(sb:SeekBar?,progress:Int,fromUser:Boolean){
                 if(fromUser){
-                    val total=(vlcPlayer?.length?:0L)
-                    if(total>0){resetVideoHudTimer();tvVideoTimeCurrent.text=formatTime((progress.toLong()*total/1000L).toInt())}
+                    val total=vlcPlayer?.length?:0L
+                    if(total>0){
+                        resetVideoHudTimer()
+                        tvVideoTimeCurrent.text=formatTime((progress.toLong()*total/1000L).toInt())
+                    }
                 }
             }
-            override fun onStartTrackingTouch(sb:SeekBar?){isVideoTracking=true;resetVideoHudTimer()}
+            override fun onStartTrackingTouch(sb:SeekBar?){
+                isVideoTracking=true
+                resetVideoHudTimer()
+            }
             override fun onStopTrackingTouch(sb:SeekBar?){
-                isVideoTracking=false;resetVideoHudTimer()
-                val total=(vlcPlayer?.length?:0L)
-                if(total>0)vlcPlayer?.setTime((sb?.progress?.toLong()?:0L)*total/1000L)
+                isVideoTracking=false
+                resetVideoHudTimer()
+                val p=vlcPlayer?:return
+                val total=try{p.length}catch(_:Throwable){0L}
+                if(total<=0L)return
+                val target=(sb?.progress?.toLong()?:0L)*total/1000L
+                try{
+                    isVlcSeeking=true
+                    layoutVideoBuffering.visibility=View.VISIBLE
+                    tvBuffering.text="Seeking / buffering..."
+                    p.setTime(target.coerceIn(0L,total))
+                    lifecycleScope.launch{
+                        delay(1200)
+                        if(isVlcSeeking&&p===vlcPlayer){
+                            isVlcSeeking=false
+                            layoutVideoBuffering.visibility=View.GONE
+                        }
+                    }
+                }catch(e:Throwable){
+                    isVlcSeeking=false
+                    layoutVideoBuffering.visibility=View.GONE
+                    Log.w(PtpConstants.TAG,"VLC seek failed",e)
+                }
             }
         })
     }
@@ -809,19 +837,51 @@ class MainActivity : AppCompatActivity() {
     private fun handlePlayPauseAction(){
         if(currentScreen==Screen.VIDEO_PLAYER){
             val p=vlcPlayer?:return
-            try{if(p.isPlaying){p.pause();btnVideoPlayPause.text="▶ PLAY";showVideoHud();updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,p.time)}else{p.play();btnVideoPlayPause.text="⏸ PAUSE";resetVideoHudTimer();updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,p.time)}}catch(_:Throwable){}
+            try{
+                if(p.isPlaying){
+                    p.pause()
+                    btnVideoPlayPause.text="▶ PLAY"
+                    showVideoHud()
+                    updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,p.time)
+                }else{
+                    p.play()
+                    btnVideoPlayPause.text="⏸ PAUSE"
+                    resetVideoHudTimer()
+                    updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,p.time)
+                }
+            }catch(e:Throwable){Log.w(PtpConstants.TAG,"VLC play/pause failed",e)}
         }else if(currentScreen==Screen.AUDIO_PLAYER){
             audioPlayer?.let{mp->try{if(mp.isPlaying){mp.pause();btnAudioPlayPause.text="▶";tvAudioPlayerStatus.text="[ PAUSED ]";showAudioHud();updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,mp.currentPosition.toLong())}else{mp.start();btnAudioPlayPause.text="⏸";tvAudioPlayerStatus.text="[ PLAYING ]";resetAudioHudTimer();updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,mp.currentPosition.toLong())}}catch(_:Exception){}}
         }
     }
 
     private fun handleRewind10Action(){
-        if(currentScreen==Screen.VIDEO_PLAYER){try{vlcPlayer?.setTime((vlcPlayer?.time?:0L-10000L).coerceAtLeast(0L));showVideoHud()}catch(_:Throwable){}
+        if(currentScreen==Screen.VIDEO_PLAYER){
+            try{
+                val p=vlcPlayer?:return
+                val target=(p.time-10000L).coerceAtLeast(0L)
+                isVlcSeeking=true
+                layoutVideoBuffering.visibility=View.VISIBLE
+                tvBuffering.text="Seeking / buffering..."
+                p.setTime(target)
+                lifecycleScope.launch{delay(1200);if(isVlcSeeking&&p===vlcPlayer){isVlcSeeking=false;layoutVideoBuffering.visibility=View.GONE}}
+                showVideoHud()
+            }catch(e:Throwable){Log.w(PtpConstants.TAG,"VLC rewind failed",e)}
         }else if(currentScreen==Screen.AUDIO_PLAYER){audioPlayer?.let{mp->try{mp.seekTo((mp.currentPosition-10000).coerceAtLeast(0));showAudioHud()}catch(_:Exception){}}}
     }
 
     private fun handleForward10Action(){
-        if(currentScreen==Screen.VIDEO_PLAYER){try{val p=vlcPlayer;if(p!=null)p.setTime((p.time+10000L).coerceAtMost(p.length));showVideoHud()}catch(_:Throwable){}
+        if(currentScreen==Screen.VIDEO_PLAYER){
+            try{
+                val p=vlcPlayer?:return
+                val target=(p.time+10000L).coerceAtMost(p.length)
+                isVlcSeeking=true
+                layoutVideoBuffering.visibility=View.VISIBLE
+                tvBuffering.text="Seeking / buffering..."
+                p.setTime(target)
+                lifecycleScope.launch{delay(1200);if(isVlcSeeking&&p===vlcPlayer){isVlcSeeking=false;layoutVideoBuffering.visibility=View.GONE}}
+                showVideoHud()
+            }catch(e:Throwable){Log.w(PtpConstants.TAG,"VLC forward failed",e)}
         }else if(currentScreen==Screen.AUDIO_PLAYER){audioPlayer?.let{mp->try{mp.seekTo((mp.currentPosition+10000).coerceAtMost(mp.duration));showAudioHud()}catch(_:Exception){}}}
     }
 
@@ -888,8 +948,14 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy(){
         hudHandler.removeCallbacks(hideVideoHudRunnable);hudHandler.removeCallbacks(hideAudioHudRunnable);stopBackgroundService()
         stopAndClearVideoPlayer();stopAndClearAudioPlayer()
-        try{bridge.stop()}catch(_:Throwable){};try{vlcPlayer?.release()}catch(_:Throwable){};try{libVlc?.release()}catch(_:Throwable){}
-        vlcPlayer=null;libVlc=null;mediaSession?.release();audioCacheManager.clearCache();lifecycleScope.launch{repository.clear()};super.onDestroy()
+        try{bridge.stop()}catch(_:Throwable){}
+        try{libVlc?.release()}catch(_:Throwable){}
+        vlcPlayer=null
+        libVlc=null
+        mediaSession?.release()
+        audioCacheManager.clearCache()
+        lifecycleScope.launch{repository.clear()}
+        super.onDestroy()
     }
 
     private fun startBackgroundService(title: String) {
@@ -914,59 +980,232 @@ class MainActivity : AppCompatActivity() {
 
     private var initJob: Job? = null
 
-    private fun initVlc() {
-        if(libVlc!=null&&vlcPlayer!=null)return
-        libVlc=LibVLC(this,arrayListOf("--network-caching=1000","--file-caching=1000","--avcodec-hw=any"))
-        vlcPlayer=VlcMediaPlayer(libVlc)
-        vlcPlayer?.setEventListener{event->runOnUiThread{
-            try{
-                if(currentScreen!=Screen.VIDEO_PLAYER)return@runOnUiThread
-                when(event.type){
-                    VlcMediaPlayer.Event.Playing->{layoutVideoBuffering.visibility=View.GONE;tvVideoError.visibility=View.GONE;btnVideoPlayPause.text="⏸ PAUSE";resetVideoHudTimer();updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,vlcPlayer?.time?:0L)}
-                    VlcMediaPlayer.Event.Paused->{layoutVideoBuffering.visibility=View.GONE;btnVideoPlayPause.text="▶ PLAY";showVideoHud();updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,vlcPlayer?.time?:0L)}
-                    VlcMediaPlayer.Event.Buffering->{val pct=event.getBuffering().toInt().coerceIn(0,100);if(pct<100&&vlcPlayer?.isPlaying!=true){layoutVideoBuffering.visibility=View.VISIBLE;tvBuffering.text="Buffering $pct%"}else if(pct>=100||vlcPlayer?.isPlaying==true)layoutVideoBuffering.visibility=View.GONE}
-                    VlcMediaPlayer.Event.EncounteredError->{layoutVideoBuffering.visibility=View.GONE;tvVideoError.text=getString(R.string.video_codec_unsupported);tvVideoError.visibility=View.VISIBLE;btnVideoPlayPause.text="▶ PLAY";showVideoHud();updateMediaSessionState(PlaybackStateCompat.STATE_ERROR,vlcPlayer?.time?:0L)}
-                    VlcMediaPlayer.Event.EndReached->{layoutVideoBuffering.visibility=View.GONE;when(videoLoopMode){LoopMode.OFF->{if(currentVideoIndex<displayedVideoList.size-1)playVideoAtIndex(currentVideoIndex+1)else{btnVideoPlayPause.text="▶ PLAY";showVideoHud();updateMediaSessionState(PlaybackStateCompat.STATE_STOPPED,vlcPlayer?.length?:0L)}};LoopMode.SINGLE->{try{vlcPlayer?.setTime(0L);vlcPlayer?.play()}catch(_:Throwable){}};LoopMode.ALL->{if(displayedVideoList.isNotEmpty())playVideoAtIndex((currentVideoIndex+1)%displayedVideoList.size)}}}
-                }
-            }catch(e:Throwable){Log.w(PtpConstants.TAG,"VLC UI event handling failed",e)}
-        }}
+    private fun initVlc(){
+        if(libVlc==null){
+            libVlc=LibVLC(this,arrayListOf("--network-caching=750","--file-caching=750","--avcodec-hw=any"))
+        }
+        if(vlcPlayer==null){
+            vlcPlayer=createVlcPlayer()
+        }
     }
 
     private fun setVlcPlaybackRate(speed:Float){
         try{
             val p=vlcPlayer?:return
-            val m=p.javaClass.methods.firstOrNull{it.name=="setRate"&&it.parameterTypes.size==1}?:return
-            val t=m.parameterTypes[0]
-            val v:Any=when{t==java.lang.Float.TYPE->speed;t==java.lang.Double.TYPE->speed.toDouble();t==java.lang.Integer.TYPE->speed.toInt();else->speed}
-            m.invoke(p,v)
+            val methods=p.javaClass.methods
+            val m=methods.firstOrNull{it.name=="setRate"&&it.parameterTypes.size==1}?:return
+            val type=m.parameterTypes[0]
+            val value:Any=when{
+                type==java.lang.Float.TYPE||type==java.lang.Float::class.java->speed
+                type==java.lang.Double.TYPE||type==java.lang.Double::class.java->speed.toDouble()
+                type==java.lang.Integer.TYPE||type==java.lang.Integer::class.java->speed.toInt()
+                else->speed
+            }
+            m.invoke(p,value)
         }catch(_:Throwable){}
     }
 
-    private data class VlcTrackChoice(val id:Int,val label:String)
+    private data class VlcTrackChoice(val id:String,val label:String)
+
     private fun readTrackValue(track:Any,names:Array<String>):Any?{
         for(name in names){
-            try{val m=track.javaClass.methods.firstOrNull{it.name==name&&it.parameterTypes.isEmpty()};val v=m?.invoke(track);if(v!=null)return v}catch(_:Throwable){}
-            try{val fname=name.removePrefix("get").replaceFirstChar{it.lowercase()};val f=track.javaClass.fields.firstOrNull{it.name==fname};val v=f?.get(track);if(v!=null)return v}catch(_:Throwable){}
+            try{
+                val m=track.javaClass.methods.firstOrNull{it.name==name&&it.parameterTypes.isEmpty()}
+                val v=m?.invoke(track)
+                if(v!=null)return v
+            }catch(_:Throwable){}
+            try{
+                val fieldName=name.removePrefix("get").replaceFirstChar{it.lowercase()}
+                val f=track.javaClass.fields.firstOrNull{it.name==fieldName}
+                val v=f?.get(track)
+                if(v!=null)return v
+            }catch(_:Throwable){}
         }
         return null
     }
-    private fun getVlcTracks(methodName:String):List<VlcTrackChoice>{
-        val p=vlcPlayer?:return emptyList()
-        return try{
-            val m=p.javaClass.methods.firstOrNull{it.name==methodName&&it.parameterTypes.isEmpty()}?:return emptyList()
-            val result=m.invoke(p)?:return emptyList()
-            val list=when(result){is Array<*>->result.toList();is Iterable<*>->result.toList();else->emptyList()}
-            list.mapNotNull{tr->if(tr==null)null else{
-                val id=(readTrackValue(tr, arrayOf("getId","getTrackId","id","trackId")) as? Number)?.toInt()?:return@mapNotNull null
-                val label=readTrackValue(tr,arrayOf("getName","getDescription","getLabel","name","description","label"))?.toString()?.ifBlank{null}?:("Track "+id)
-                VlcTrackChoice(id,label)
-            }}
-        }catch(_:Throwable){emptyList()}
-    }
-    private fun setVlcTrack(methodName:String,trackId:Int){
-        try{val p=vlcPlayer?:return;val m=p.javaClass.methods.firstOrNull{it.name==methodName&&it.parameterTypes.size==1&&(it.parameterTypes[0]==java.lang.Integer.TYPE||it.parameterTypes[0]==java.lang.Integer::class.java)}?:return;m.invoke(p,trackId)}catch(_:Throwable){}
+
+    private fun parseVlcTrackResult(result:Any?):List<VlcTrackChoice>{
+        if(result==null)return emptyList()
+        val out=mutableListOf<VlcTrackChoice>()
+        if(result is Map<*,*>){
+            result.forEach{(k,v)->
+                if(k!=null&&v!=null){
+                    val id=k.toString()
+                    val label=v.toString().ifBlank{"Track "+id}
+                    if(id!="-1")out.add(VlcTrackChoice(id,label))
+                }
+            }
+            return out
+        }
+        val items=when(result){
+            is Array<*>->result.asList()
+            is Iterable<*>->result.toList()
+            else->emptyList<Any?>()
+        }
+        for(track in items){
+            if(track==null)continue
+            val rawId=readTrackValue(track,arrayOf("getId","getTrackId","id","trackId"))?:continue
+            val id=rawId.toString()
+            if(id=="-1")continue
+            val label=readTrackValue(track,arrayOf("getName","getDescription","getLabel","name","description","label","language"))?.toString()?.ifBlank{null}?:("Track "+id)
+            out.add(VlcTrackChoice(id,label))
+        }
+        return out
     }
 
+    private fun getMediaVlcTracks(typeName:String):List<VlcTrackChoice>{
+        val media=currentVlcMedia?:return emptyList()
+        return try{
+            val countMethod=media.javaClass.methods.firstOrNull{it.name=="getTrackCount"&&it.parameterTypes.isEmpty()}?:return emptyList()
+            val getMethod=media.javaClass.methods.firstOrNull{it.name=="getTrack"&&it.parameterTypes.size==1}?:return emptyList()
+            val count=(countMethod.invoke(media) as? Number)?.toInt()?:0
+            val out=mutableListOf<VlcTrackChoice>()
+            for(i in 0 until count){
+                val track=getMethod.invoke(media,i)?:continue
+                val type=readTrackValue(track,arrayOf("getType","type"))?.toString()?.lowercase()?:""
+                val matches=when(typeName.lowercase()){
+                    "audio"->type.contains("audio")
+                    else->type.contains("text")||type.contains("subtitle")||type.contains("spu")
+                }
+                if(!matches)continue
+                val id=readTrackValue(track,arrayOf("getId","id"))?.toString()?:continue
+                val label=readTrackValue(track,arrayOf("getDescription","description","getLanguage","language","getName","name"))?.toString()?.ifBlank{null}?:("Track "+id)
+                out.add(VlcTrackChoice(id,label))
+            }
+            out
+        }catch(_:Throwable){emptyList()}
+    }
+
+    private fun getGenericVlcTracks(typeName:String):List<VlcTrackChoice>{
+        val p=vlcPlayer?:return emptyList()
+        val methods=p.javaClass.methods.filter{it.name=="getTracks"&&it.parameterTypes.size==1}
+        for(method in methods){
+            val parameterType=method.parameterTypes[0]
+            if(!parameterType.isEnum)continue
+            val constants=parameterType.enumConstants?:continue
+            for(constant in constants){
+                val name=constant.toString().lowercase()
+                val matches=if(typeName.equals("audio",true))name.contains("audio") else name.contains("text")||name.contains("subtitle")||name.contains("spu")
+                if(!matches)continue
+                try{
+                    val parsed=parseVlcTrackResult(method.invoke(p,constant))
+                    if(parsed.isNotEmpty())return parsed
+                }catch(_:Throwable){}
+            }
+        }
+        return emptyList()
+    }
+
+    private fun getVlcTracks(methodName:String,typeName:String):List<VlcTrackChoice>{
+        val p=vlcPlayer?:return emptyList()
+        val direct=try{
+            val m=p.javaClass.methods.firstOrNull{it.name==methodName&&it.parameterTypes.isEmpty()}
+            parseVlcTrackResult(m?.invoke(p))
+        }catch(_:Throwable){emptyList()}
+        if(direct.isNotEmpty())return direct
+
+        val descriptionMethod=if(typeName.equals("audio",true))"getAudioTrackDescription" else "getSpuTrackDescription"
+        val described=try{
+            val m=p.javaClass.methods.firstOrNull{it.name==descriptionMethod&&it.parameterTypes.isEmpty()}
+            parseVlcTrackResult(m?.invoke(p))
+        }catch(_:Throwable){emptyList()}
+        if(described.isNotEmpty())return described
+
+        val generic=getGenericVlcTracks(typeName)
+        if(generic.isNotEmpty())return generic
+        return getMediaVlcTracks(typeName)
+    }
+
+    private fun setVlcTrack(methodNames:Array<String>,trackId:String){
+        val p=vlcPlayer?:return
+        for(method in p.javaClass.methods){
+            if(method.name !in methodNames||method.parameterTypes.size!=1)continue
+            val type=method.parameterTypes[0]
+            val arg:Any?=when{
+                type==String::class.java->trackId
+                type==java.lang.Integer.TYPE||type==java.lang.Integer::class.java->trackId.toIntOrNull()
+                type==java.lang.Long.TYPE||type==java.lang.Long::class.java->trackId.toLongOrNull()
+                else->null
+            }
+            if(arg==null)continue
+            try{method.invoke(p,arg);return}catch(_:Throwable){}
+        }
+    }
+
+    private fun unselectVlcTrack(typeName:String){
+        val p=vlcPlayer?:return
+        for(method in p.javaClass.methods){
+            if(method.name!="unselectTrackType"||method.parameterTypes.size!=1)continue
+            val type=method.parameterTypes[0]
+            if(type.isEnum){
+                for(constant in type.enumConstants?:emptyArray()){
+                    val n=constant.toString().lowercase()
+                    val matches=if(typeName.equals("audio",true))n.contains("audio") else n.contains("text")||n.contains("subtitle")||n.contains("spu")
+                    if(matches){try{method.invoke(p,constant);return}catch(_:Throwable){}}
+                }
+            }else if(type==String::class.java){
+                try{method.invoke(p,if(typeName.equals("audio",true))"Audio" else "Text");return}catch(_:Throwable){}
+            }
+        }
+        if(typeName.equals("audio",true)){setVlcTrack(arrayOf("setAudioTrack","selectTrack"),"-1")}else{setVlcTrack(arrayOf("setSpuTrack","selectTrack"),"-1")}
+    }
+
+    private fun refreshVlcTrackButtonsSoon(sessionId:Long){
+        lifecycleScope.launch{
+            repeat(6){attempt->
+                delay(if(attempt==0)200L else 350L)
+                if(sessionId!=currentVideoSessionId||currentScreen!=Screen.VIDEO_PLAYER)return@launch
+                val audio=getVlcTracks("getAudioTracks","audio")
+                val subs=getVlcTracks("getSpuTracks","subtitle")
+                if(audio.isNotEmpty())btnVideoAudioTrack.text="🔊 AUDIO ("+audio.size+")"
+                if(subs.isNotEmpty())btnVideoSubs.text="💬 SUBS ("+subs.size+")"
+                if(audio.isNotEmpty()||subs.isNotEmpty())return@launch
+            }
+        }
+    }
+
+    private fun showSubtitlesDialog(){
+        lifecycleScope.launch{
+            var tracks=emptyList<VlcTrackChoice>()
+            repeat(6){attempt->
+                tracks=getVlcTracks("getSpuTracks","subtitle")
+                if(tracks.isNotEmpty())return@repeat
+                delay(if(attempt==0)100L else 250L)
+            }
+            if(tracks.isEmpty()){
+                Toast.makeText(this@MainActivity,"No subtitle tracks found in this video",Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val labels=arrayOf("Subtitles: Off")+tracks.map{it.label}
+            AlertDialog.Builder(this@MainActivity).setTitle(getString(R.string.subtitles_track)).setItems(labels){d,which->
+                if(which==0){unselectVlcTrack("subtitle");btnVideoSubs.text="💬 SUBS"}
+                else{val t=tracks[which-1];setVlcTrack(arrayOf("setSpuTrack","selectTrack"),t.id);btnVideoSubs.text="💬 "+t.label}
+                d.dismiss();btnVideoSubs.requestFocus()
+            }.setNegativeButton("CANCEL",null).show()
+        }
+    }
+
+    private fun showAudioTrackDialog(){
+        lifecycleScope.launch{
+            var tracks=emptyList<VlcTrackChoice>()
+            repeat(6){attempt->
+                tracks=getVlcTracks("getAudioTracks","audio")
+                if(tracks.isNotEmpty())return@repeat
+                delay(if(attempt==0)100L else 250L)
+            }
+            if(tracks.isEmpty()){
+                Toast.makeText(this@MainActivity,"No audio tracks found in this video",Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val labels=tracks.map{it.label}.toTypedArray()
+            AlertDialog.Builder(this@MainActivity).setTitle(getString(R.string.audio_track)).setItems(labels){d,which->
+                val t=tracks[which]
+                setVlcTrack(arrayOf("setAudioTrack","selectTrack"),t.id)
+                btnVideoAudioTrack.text="🔊 "+t.label
+                d.dismiss();btnVideoAudioTrack.requestFocus()
+            }.setNegativeButton("CANCEL",null).show()
+        }
+    }
     private fun handleUsbState(state: UsbConnectionState) {
         when (state) {
             is UsbConnectionState.Idle -> {
@@ -1098,33 +1337,146 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun playVideoAtIndex(index: Int) {
-        if (index < 0 || index >= displayedVideoList.size) return
-        currentVideoIndex = index
-        val item = displayedVideoList[index]
-        startVideoPlayback(item)
+        if(index<0||index>=displayedVideoList.size)return
+        currentVideoIndex=index
+        startVideoPlayback(displayedVideoList[index])
+    }
+
+    private fun releaseVlcPlayerForSwitch(){
+        isVlcSeeking=false
+        bridge.invalidatePlayback()
+        vlcGenerationCounter++
+        val old=vlcPlayer
+        vlcPlayer=null
+        try{old?.stop()}catch(_:Throwable){}
+        try{old?.detachViews()}catch(_:Throwable){}
+        try{old?.release()}catch(_:Throwable){}
+        try{currentVlcMedia?.release()}catch(_:Throwable){}
+        currentVlcMedia=null
+    }
+
+    private fun createVlcPlayer():VlcMediaPlayer?{
+        val engine=libVlc?:return null
+        val generation=++vlcGenerationCounter
+        val player=try{VlcMediaPlayer(engine)}catch(e:Throwable){Log.e(PtpConstants.TAG,"Could not create VLC player",e);return null}
+        player.setEventListener{event->runOnUiThread{
+            try{
+                if(player!==vlcPlayer||generation!=vlcGenerationCounter||currentScreen!=Screen.VIDEO_PLAYER)return@runOnUiThread
+                when(event.type){
+                    VlcMediaPlayer.Event.Playing->{
+                        tvVideoError.visibility=View.GONE
+                        btnVideoPlayPause.text="⏸ PAUSE"
+                        if(!isVlcSeeking){layoutVideoBuffering.visibility=View.GONE}
+                        resetVideoHudTimer()
+                        updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING,player.time)
+                    }
+                    VlcMediaPlayer.Event.Paused->{
+                        if(!isVlcSeeking){layoutVideoBuffering.visibility=View.GONE}
+                        btnVideoPlayPause.text="▶ PLAY"
+                        showVideoHud()
+                        updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED,player.time)
+                    }
+                    VlcMediaPlayer.Event.Buffering->{
+                        val pct=event.getBuffering().toInt().coerceIn(0,100)
+                        if(pct<100||isVlcSeeking){
+                            layoutVideoBuffering.visibility=View.VISIBLE
+                            tvBuffering.text=if(isVlcSeeking)"Seeking / buffering..." else "Buffering $pct%"
+                        }else{
+                            isVlcSeeking=false
+                            layoutVideoBuffering.visibility=View.GONE
+                        }
+                    }
+                    VlcMediaPlayer.Event.EncounteredError->{
+                        isVlcSeeking=false
+                        layoutVideoBuffering.visibility=View.GONE
+                        tvVideoError.text="Video could not be loaded from the phone"
+                        tvVideoError.visibility=View.VISIBLE
+                        btnVideoPlayPause.text="▶ PLAY"
+                        showVideoHud()
+                        updateMediaSessionState(PlaybackStateCompat.STATE_ERROR,player.time)
+                    }
+                    VlcMediaPlayer.Event.EndReached->{
+                        isVlcSeeking=false
+                        layoutVideoBuffering.visibility=View.GONE
+                        when(videoLoopMode){
+                            LoopMode.OFF->{
+                                if(currentVideoIndex<displayedVideoList.size-1)playVideoAtIndex(currentVideoIndex+1)
+                                else{btnVideoPlayPause.text="▶ PLAY";showVideoHud();updateMediaSessionState(PlaybackStateCompat.STATE_STOPPED,try{player.length}catch(_:Throwable){0L})}
+                            }
+                            LoopMode.SINGLE->{try{player.setTime(0L);player.play()}catch(_:Throwable){}}
+                            LoopMode.ALL->{if(displayedVideoList.isNotEmpty())playVideoAtIndex((currentVideoIndex+1)%displayedVideoList.size)}
+                        }
+                    }
+                }
+            }catch(e:Throwable){Log.w(PtpConstants.TAG,"VLC UI event handling failed",e)}
+        }}
+        return player
     }
 
     private fun startVideoPlayback(item:PtpMediaItem){
         val sessionId=++currentVideoSessionId
         videoProgressJob?.cancel()
-        try{vlcPlayer?.stop()}catch(_:Throwable){}
-        try{vlcPlayer?.detachViews()}catch(_:Throwable){}
-        currentVlcMedia?.release();currentVlcMedia=null
+        releaseVlcPlayerForSwitch()
         showScreen(Screen.VIDEO_PLAYER)
-        tvVideoError.visibility=View.GONE;tvVideoError.text=""
+        tvVideoError.visibility=View.GONE
+        tvVideoError.text=""
         tvVideoTitle.text=item.displayName
-        tvVideoBadgeFormat.text=item.filename.substringAfterLast('.',"VIDEO").uppercase()
-        tvVideoTimeCurrent.text="00:00";tvVideoTimeTotal.text="00:00";sbVideoSeek.progress=0
-        btnVideoPlayPause.text="⏸ PAUSE";btnVideoSubs.text="💬 SUBS";btnVideoAudioTrack.text="🔊 AUDIO"
-        currentPlaybackSpeed=1.0f;setPlaybackSpeed(1.0f);updateLoopButtonUi()
-        tvBuffering.text=getString(R.string.buffering);layoutVideoBuffering.visibility=View.VISIBLE;showVideoHud()
-        val p=vlcPlayer;val engine=libVlc
-        if(p==null||engine==null||bridge.port<=0){layoutVideoBuffering.visibility=View.GONE;tvVideoError.text=getString(R.string.video_load_failed);tvVideoError.visibility=View.VISIBLE;btnVideoPlayPause.text="▶ PLAY";return}
+        tvVideoBadgeFormat.text=item.filename.substringAfterLast(".","VIDEO").uppercase()
+        tvVideoTimeCurrent.text="00:00"
+        tvVideoTimeTotal.text="00:00"
+        sbVideoSeek.progress=0
+        btnVideoPlayPause.text="⏸ PAUSE"
+        btnVideoSubs.text="💬 SUBS"
+        btnVideoAudioTrack.text="🔊 AUDIO"
+        currentSubtitlesTrack=-1
+        currentPlaybackSpeed=1.0f
+        setPlaybackSpeed(1.0f)
+        updateLoopButtonUi()
+        tvBuffering.text=getString(R.string.buffering)
+        layoutVideoBuffering.visibility=View.VISIBLE
+        showVideoHud()
+
+        val engine=libVlc
+        if(engine==null||bridge.port<=0){
+            layoutVideoBuffering.visibility=View.GONE
+            tvVideoError.text=getString(R.string.video_load_failed)
+            tvVideoError.visibility=View.VISIBLE
+            btnVideoPlayPause.text="▶ PLAY"
+            return
+        }
+
+        bridge.beginPlayback(item.handle)
+        val p=createVlcPlayer()
+        if(p==null){
+            layoutVideoBuffering.visibility=View.GONE
+            tvVideoError.text=getString(R.string.video_load_failed)
+            tvVideoError.visibility=View.VISIBLE
+            btnVideoPlayPause.text="▶ PLAY"
+            return
+        }
+        vlcPlayer=p
+
         try{
-            currentVlcMedia=Media(engine,Uri.parse(bridge.urlFor(item))).apply{addOption(":http-reconnect=true");addOption(":network-caching=1000");addOption(":file-caching=1000")}
-            p.attachViews(videoLayout,null,true,false);p.setMedia(currentVlcMedia);p.play();startVideoProgressLoop(sessionId)
+            val media=Media(engine,Uri.parse(bridge.urlFor(item))).apply{
+                addOption(":http-reconnect=true")
+                addOption(":http-continuous=true")
+                addOption(":network-caching=750")
+                addOption(":file-caching=750")
+            }
+            currentVlcMedia=media
+            p.attachViews(videoLayout,null,true,false)
+            p.setMedia(media)
+            p.play()
+            startVideoProgressLoop(sessionId)
+            refreshVlcTrackButtonsSoon(sessionId)
         }catch(e:Throwable){
-            if(sessionId==currentVideoSessionId){layoutVideoBuffering.visibility=View.GONE;tvVideoError.text=getString(R.string.video_load_failed);tvVideoError.visibility=View.VISIBLE;btnVideoPlayPause.text="▶ PLAY";showVideoHud();Log.e(PtpConstants.TAG,"Failed to open PTP media in VLC",e)}
+            if(sessionId==currentVideoSessionId){
+                Log.e(PtpConstants.TAG,"Failed to open PTP media in VLC",e)
+                layoutVideoBuffering.visibility=View.GONE
+                tvVideoError.text=getString(R.string.video_load_failed)
+                tvVideoError.visibility=View.VISIBLE
+                btnVideoPlayPause.text="▶ PLAY"
+            }
         }
     }
 
@@ -1132,20 +1484,32 @@ class MainActivity : AppCompatActivity() {
         videoProgressJob?.cancel()
         videoProgressJob=lifecycleScope.launch{
             while(currentScreen==Screen.VIDEO_PLAYER&&sessionId==currentVideoSessionId){
-                try{val p=vlcPlayer;if(p!=null&&p.length>0&&!isVideoTracking){val total=p.length;if(total>0){sbVideoSeek.progress=(p.position*1000f).toInt().coerceIn(0,1000);tvVideoTimeCurrent.text=formatTime(p.time.toInt().coerceAtLeast(0));tvVideoTimeTotal.text=formatTime(total.toInt().coerceAtLeast(0))}}}catch(_:Throwable){}
+                try{
+                    val p=vlcPlayer
+                    if(p!=null&&p.length>0&&!isVideoTracking){
+                        val total=p.length
+                        if(total>0){
+                            sbVideoSeek.progress=(p.position*1000f).toInt().coerceIn(0,1000)
+                            tvVideoTimeCurrent.text=formatTime(p.time.toInt().coerceAtLeast(0))
+                            tvVideoTimeTotal.text=formatTime(total.toInt().coerceAtLeast(0))
+                        }
+                    }
+                }catch(_:Throwable){}
                 delay(300)
             }
         }
     }
 
     private fun stopAndClearVideoPlayer(){
-        currentVideoSessionId++;hudHandler.removeCallbacks(hideVideoHudRunnable);videoProgressJob?.cancel()
-        try{vlcPlayer?.stop()}catch(_:Throwable){};try{vlcPlayer?.detachViews()}catch(_:Throwable){}
-        currentVlcMedia?.release();currentVlcMedia=null
-        layoutVideoBuffering.visibility=View.GONE;tvVideoError.visibility=View.GONE;tvVideoError.text=""
+        currentVideoSessionId++
+        hudHandler.removeCallbacks(hideVideoHudRunnable)
+        videoProgressJob?.cancel()
+        releaseVlcPlayerForSwitch()
+        layoutVideoBuffering.visibility=View.GONE
+        tvVideoError.visibility=View.GONE
+        tvVideoError.text=""
         updateMediaSessionState(PlaybackStateCompat.STATE_NONE,0L)
     }
-
     fun playAudioAtIndex(index: Int) {
         if (index < 0 || index >= displayedAudioList.size) return
         currentAudioIndex = index
